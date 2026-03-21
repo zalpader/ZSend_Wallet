@@ -16,7 +16,7 @@ from pathlib import Path
 import requests
 from requests.auth import HTTPBasicAuth
 
-wallet_version: float = 0.84
+wallet_version: float = 0.85
 
 
 def resource_path(relative_path):
@@ -918,6 +918,7 @@ QMenuBar::item:pressed{background:#21262d}
 QMenu{background:#21262d;color:#e6edf3;border:1px solid #30363d;font-size:13px}
 QMenu::item{padding:6px 20px 6px 12px}
 QMenu::item:selected{background:#2d333b}
+QMenu::item:disabled{color:#484f58}
 """
 
 
@@ -1871,12 +1872,6 @@ class _NodeVersionWorker(QThread):
 
 
 class _CenteredTabWidget(QTabWidget):
-    """QTabWidget whose tab bar is always centred (not left-aligned, not stretched).
-
-    setStyleSheet inside resizeEvent is expensive (full CSS re-parse + relayout).
-    We debounce it with a 60 ms one-shot timer so the cost is paid only once
-    after the user finishes dragging the window edge, not dozens of times per second.
-    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1937,7 +1932,6 @@ class MainWindow(QMainWindow):
         self.show(); self.raise_(); self.activateWindow()
 
     def closeEvent(self, event):
-        """Gracefully stop all background threads before the window is destroyed."""
         self._timer.stop()
         for w in list(_RUNNING_WORKERS):
             if hasattr(w, 'stop'):
@@ -1957,7 +1951,8 @@ class MainWindow(QMainWindow):
         wm = mb.addMenu("Wallet")
         self._act(wm, "Refresh",           self.refresh,      "F5")
         wm.addSeparator()
-        self._act(wm, "Import Private Key", self._import_key)
+        self._act_import = self._act(wm, "Import Private Key", self._import_key)
+        self._act_import.setEnabled(False)
         wm.addSeparator()
         self._act(wm, "Stop Node && Exit",  self._quit_and_stop)
         self._act(wm, "Exit",               self.close)
@@ -1972,6 +1967,7 @@ class MainWindow(QMainWindow):
         a = QAction(text, self); a.triggered.connect(slot)
         if sc: a.setShortcut(sc)
         menu.addAction(a)
+        return a
 
     def _build_ui(self):
         cw = QWidget(); self.setCentralWidget(cw)
@@ -2323,7 +2319,6 @@ class MainWindow(QMainWindow):
         self._update_summary()
 
     def _update_send_btn(self):
-        """Enable SEND only when: to-address non-empty & valid, amount > 0."""
         if not hasattr(self, 'btn_send'):
             return
         to = self.e_to.text().strip()
@@ -2336,7 +2331,6 @@ class MainWindow(QMainWindow):
         self.btn_send.setEnabled(to_ok and amt > 0)
 
     def _validate_to_addr(self, text: str):
-        """Highlight e_to red when address format looks wrong; update SEND state."""
         t = text.strip()
         if not t:
             self.e_to.setStyleSheet("")
@@ -2523,8 +2517,10 @@ class MainWindow(QMainWindow):
             self.sync_bar.setStyleSheet(
                 f"QProgressBar#sbar::chunk{{background:"
                 f"{'#238636' if synced else '#f7a32c'};border-radius:3px}}")
+            self._act_import.setEnabled(synced)
         else:
             self.sync_bar.setValue(0); self.sync_bar.setFormat("-")
+            self._act_import.setEnabled(False)
 
         tb        = data.get("total_bal",  {})
         new_t_bal = data.get("t_balances", {})
@@ -2563,6 +2559,7 @@ class MainWindow(QMainWindow):
 
     def _on_err(self, msg: str):
         self._refresh_running = False
+        self._act_import.setEnabled(False)
         self.lbl_status.setText("  Not connected")
         self.lbl_status.setStyleSheet("color:#f85149;font-weight:700;padding:0 6px;")
         self.sync_bar.setValue(0); self.sync_bar.setFormat("Not connected")
@@ -2578,6 +2575,7 @@ class MainWindow(QMainWindow):
 
     def _on_reindexing(self, data: dict):
         self._refresh_running = False
+        self._act_import.setEnabled(False)
         info  = data.get("info",  {})
         chain = data.get("chain", {})
         blocks  = info.get("blocks",  "-")
@@ -2883,7 +2881,6 @@ class MainWindow(QMainWindow):
 
     def _send_err(self, msg: str):
         self.lbl_op.setText(f"ERROR: {msg}"); QMessageBox.critical(self, "Send Error", msg)
-
 
 
 class _WalletStylePlaceholder:
