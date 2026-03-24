@@ -1,5 +1,13 @@
 <img width="752" height="842" alt="Screenshot 2026-03-21 004242" src="https://github.com/user-attachments/assets/8e133864-4ac3-46e5-850d-533dfdeb6d6c" />
 
+## Main functions of the ZSend Wallet:
+* Create T-addresses (transparent) and Z-addresses (private)
+* Send and receive BTCZ
+* Add memos to transactions (for Z-addresses)
+* View your balance and transaction history
+* Export and import private keys
+* Manage addresses via a user-friendly interface
+
 ## 📦 Requirements
 
 - Python 3.9+
