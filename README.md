@@ -38,5 +38,5 @@ pyinstaller --noconfirm --onefile --windowed --icon "C:\Users\User\Desktop\ZSend
 
 Addresses for tip 💵
 ```
-t1fZQ6GSVwcpKx7sa7K7LR24UXsEbhyfvvq
+t1fjtqgoCboGToe6Mv68n5AvdDZaL6ZSend
 ```
