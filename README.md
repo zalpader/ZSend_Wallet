@@ -1,11 +1,12 @@
-<img width="752" height="842" alt="Screenshot 2026-03-21 004242" src="https://github.com/user-attachments/assets/8e133864-4ac3-46e5-850d-533dfdeb6d6c" />
+<img width="762" height="812" alt="Screenshot 2026-05-08 231941" src="https://github.com/user-attachments/assets/170952d3-d68f-4485-98f5-f849fa4ed9c6" />
 
 ## Main functions of the ZSend Wallet:
 * Create T-addresses (transparent) and Z-addresses (private)
 * Send and receive BTCZ
 * Add memos to transactions (for Z-addresses)
 * View your balance and transaction history
-* Export and import private keys
+* Exporting and importing private keys for individual addresses
+* Export and import all private keys from the entire wallet.dat file
 * Manage addresses via a user-friendly interface
 
 ## 📦 Requirements
@@ -14,7 +15,7 @@
 - Install dependencies:
 
   ```
-  pip install PySide6 requests
+  pip install PySide6 requests qrcode[pil] Pillow
   ```
 
 ## ⚙️ Node
@@ -22,18 +23,16 @@
 Place  `bitcoinz-cli.exe`, `bitcoinzd.exe`, `bitcoinz-tx.exe` in the same folder as `ZSend Wallet.py` or into a folder named “node”
 
 ## 🛠 Build EXE
-
-```
-pyinstaller --noconfirm --onefile --windowed --icon "C:\Users\User\Desktop\ZSend_Wallet\ZSend_Wallet.ico" --add-data "C:\Users\User\Desktop\ZSend_Wallet\ZSend_Wallet.ico;."  "C:\Users\User\Desktop\ZSend_Wallet\ZSend Wallet.py"
-```
+The script `build_wallet.bat` will automatically install/check the required build tools, download the required BitcoinZ Node binaries if needed, and create the final .exe package for you.
 
 <details>
   <summary>More Screenshots</summary>
-  <img width="761" height="850" alt="Screenshot 2026-03-21 003832" src="https://github.com/user-attachments/assets/87fab4e3-d9cc-48f0-af83-5370f9080045" />
-  <img width="752" height="842" alt="Screenshot 2026-03-21 004322" src="https://github.com/user-attachments/assets/27699f8a-6769-47db-90a8-a4fbbe7d5b7f" />
-  <img width="762" height="850" alt="Screenshot 2026-03-21 004343" src="https://github.com/user-attachments/assets/3d30450b-511f-4d41-80c0-058688ac3b4c" />
-  <img width="763" height="981" alt="Screenshot 2026-03-21 004449" src="https://github.com/user-attachments/assets/46fdb8c4-c424-40d4-a402-72453d8ea110" />
-  <img width="759" height="847" alt="Screenshot 2026-03-21 004558" src="https://github.com/user-attachments/assets/bee6fabb-7efb-49dc-a781-debc91359bcd" />
+<img width="762" height="812" alt="Screenshot 2026-05-08 232303" src="https://github.com/user-attachments/assets/3922d201-85e4-46cd-888e-277ad7331d6c" />
+<img width="766" height="815" alt="Screenshot 2026-05-08 232146" src="https://github.com/user-attachments/assets/6123910c-8313-48c4-9ba1-f057238e005f" />
+<img width="762" height="812" alt="Screenshot 2026-05-08 232112" src="https://github.com/user-attachments/assets/d11df6cf-0902-4c48-85df-ee3f8b9707da" />
+<img width="762" height="812" alt="Screenshot 2026-05-08 232058" src="https://github.com/user-attachments/assets/29f09ba1-fb7f-42db-bafa-59d2c37368f0" />
+<img width="762" height="812" alt="Screenshot 2026-05-08 232019" src="https://github.com/user-attachments/assets/191c7ac6-705c-445f-9568-7b3020a3d6d4" />
+
 </details>
 
 Addresses for tip 💵
