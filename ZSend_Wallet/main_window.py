@@ -1269,7 +1269,7 @@ class MainWindow(QMainWindow):
         peers   = info.get("connections", "-")
 
         self._set_status_visual("syncing", "  " + tr("dialogs.main_window.synchronizing"))
-        self.lbl_blocks.setText(tr("dialogs.main_window.blocks", value=f"{blocks} / {headers}"))
+        self.lbl_blocks.setText(tr("dialogs.main_window.blocks", value=f"{blocks}"))
         self.lbl_peers.setText(tr("dialogs.main_window.peers", value=peers))
 
         vp = chain.get("verificationprogress")
