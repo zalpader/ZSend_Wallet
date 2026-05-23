@@ -1081,7 +1081,7 @@ class TxDetailDialog(_DraggableDialog):
 
     def _open_explorer(self):
         if self._txid:
-            QDesktopServices.openUrl(QUrl(f"https://explorer.btcz.rocks/tx/{self._txid}"))
+            QDesktopServices.openUrl(QUrl(f"https://explorer.btcz.zelcore.io/tx/{self._txid}"))
 
     def _sep(self):
         f = QFrame()

@@ -276,7 +276,7 @@ def _save_qr_png(window, addr: str, pix: QPixmap | None, btn: QPushButton) -> No
 
 def view_address_on_explorer(addr: str) -> None:
     if addr:
-        QDesktopServices.openUrl(QUrl(f"https://explorer.btcz.rocks/address/{addr}"))
+        QDesktopServices.openUrl(QUrl(f"https://explorer.btcz.zelcore.io/address/{addr}"))
 
 
 def t_context_menu(window, pos) -> None:

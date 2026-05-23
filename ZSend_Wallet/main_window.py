@@ -1376,7 +1376,7 @@ class MainWindow(QMainWindow):
         if act == a_det:
             TxDetailDialog(self, tx, self.rpc).exec()
         elif act == a_exp and txid:
-            QDesktopServices.openUrl(QUrl(f"https://explorer.btcz.rocks/tx/{txid}"))
+            QDesktopServices.openUrl(QUrl(f"https://explorer.btcz.zelcore.io/tx/{txid}"))
         elif act == a_copy:
             QApplication.clipboard().setText(txid)
         elif act == a_addr and addr_to_copy:
