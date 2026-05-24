@@ -9,7 +9,7 @@ import subprocess
 import json
 import io
 import binascii
-import random
+import secrets
 import hashlib
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -115,16 +115,16 @@ PARAMS_FILES = [
 PARAMS_TOTAL_SIZE = sum(f["size"] for f in PARAMS_FILES)
 
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-_RNG = random.SystemRandom()
 
 
 def _b58(n: int) -> str:
-    return "".join(_RNG.choice(_B58) for _ in range(n))
+    return "".join(secrets.choice(_B58) for _ in range(n))
 
 
 _ADDNODES = [
     "152.53.180.255:1989",
     "51.222.50.26:1989",
+    "109.199.122.150:1989",
 ]
 
 _RPC_DEFAULT_PORT = 1979
@@ -172,6 +172,81 @@ def read_conf(path: Path = CONF_PATH) -> dict:
     return result
 
 
+def read_conf_values(path: Path, key_name: str) -> list[str]:
+    values: list[str] = []
+    wanted = str(key_name or "").strip().lower()
+    if not wanted or not path.exists():
+        return values
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                if key.strip().lower() == wanted:
+                    values.append(value.strip())
+    except OSError:
+        pass
+    return values
+
+
+def append_conf_lines(path: Path, lines: list[str]) -> None:
+    clean_lines = [line for line in lines if str(line).strip()]
+    if not clean_lines:
+        return
+
+    prefix = ""
+    try:
+        if path.exists() and path.stat().st_size > 0:
+            with open(path, "rb") as f:
+                f.seek(-1, 2)
+                if f.read(1) != b"\n":
+                    prefix = "\n"
+    except OSError:
+        prefix = "\n"
+
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(prefix + "\n".join(clean_lines) + "\n")
+
+
+def normalize_addnode_spacing(path: Path) -> None:
+    if not path.exists():
+        return
+
+    def is_addnode(line: str) -> bool:
+        stripped = line.strip()
+        return bool(stripped) and not stripped.startswith("#") and stripped.lower().startswith("addnode=")
+
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+
+    changed = False
+    cleaned: list[str] = []
+    for index, line in enumerate(lines):
+        if line.strip():
+            cleaned.append(line)
+            continue
+
+        prev_line = next((candidate for candidate in reversed(cleaned) if candidate.strip()), "")
+        next_line = next((candidate for candidate in lines[index + 1 :] if candidate.strip()), "")
+        if is_addnode(prev_line) and is_addnode(next_line):
+            changed = True
+            continue
+
+        cleaned.append(line)
+
+    if not changed:
+        return
+
+    try:
+        path.write_text("\n".join(cleaned).rstrip() + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def ensure_conf(path: Path = CONF_PATH) -> dict:
     debug_log("ensure_conf called", path=str(path), exists=path.exists())
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -200,18 +275,19 @@ def ensure_conf(path: Path = CONF_PATH) -> dict:
             to_add.append(f"rpcuser={_b58(16)}")
         if not existing.get("rpcpassword"):
             to_add.append(f"rpcpassword={_b58(32)}")
-        if "addnode" not in existing:
-            for node in _ADDNODES:
+        existing_addnodes = {node.lower() for node in read_conf_values(path, "addnode")}
+        for node in _ADDNODES:
+            if node.lower() not in existing_addnodes:
                 to_add.append(f"addnode={node}")
         if not existing.get("exportdir"):
             to_add.append(f"exportdir={EXPORT_DIR.as_posix()}")
         if to_add:
             try:
-                with open(path, "a", encoding="utf-8") as f:
-                    f.write("\n" + "\n".join(to_add) + "\n")
+                append_conf_lines(path, to_add)
             except OSError:
                 pass
 
+    normalize_addnode_spacing(path)
     cfg = read_conf(path)
     debug_log(
         "ensure_conf finished",
@@ -234,8 +310,7 @@ def ensure_exportdir(path: Path = CONF_PATH) -> tuple[Path, bool]:
         export_path = EXPORT_DIR
         changed = True
         try:
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(f"\nexportdir={export_path.as_posix()}\n")
+            append_conf_lines(path, [f"exportdir={export_path.as_posix()}"])
         except OSError:
             pass
     export_path.mkdir(parents=True, exist_ok=True)
