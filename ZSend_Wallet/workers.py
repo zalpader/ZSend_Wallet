@@ -364,6 +364,155 @@ class RefreshWorker(QThread):
         except Exception:
             return None
 
+    @staticmethod
+    def _tx_entry_key(tx: dict) -> tuple[str, str, str, str, str, str, str]:
+        try:
+            amount = f"{float(tx.get('amount', 0) or 0):.8f}"
+        except Exception:
+            amount = "0.00000000"
+        return (
+            str(tx.get("txid", "") or ""),
+            str(tx.get("category", "") or ""),
+            str(tx.get("address", "") or ""),
+            amount,
+            str(tx.get("outindex", tx.get("output", "")) if tx.get("outindex", tx.get("output", "")) is not None else ""),
+            str(tx.get("jsindex", "") if tx.get("jsindex", "") is not None else ""),
+            str(tx.get("jsoutindex", "") if tx.get("jsoutindex", "") is not None else ""),
+        )
+
+    @staticmethod
+    def _shielded_item_amount(item: dict) -> float:
+        for key in ("valueZat", "amountZat"):
+            value = item.get(key)
+            if value not in (None, ""):
+                try:
+                    return int(value) / 100_000_000
+                except Exception:
+                    pass
+        for key in ("value", "amount"):
+            value = item.get(key)
+            if value not in (None, ""):
+                try:
+                    return float(value)
+                except Exception:
+                    pass
+        return 0.0
+
+    @staticmethod
+    def _status_from_confirmations(confirmations: int) -> str:
+        if confirmations < 0:
+            return "conflicted"
+        if confirmations == 0:
+            return "pending"
+        return "confirmed"
+
+    def _node_tx_metadata(self, txid: str) -> dict:
+        try:
+            source = self.rpc.getTransaction(txid) or {}
+        except Exception:
+            try:
+                source = self.rpc.getRawTransaction(txid) or {}
+            except Exception:
+                source = {}
+
+        try:
+            confirmations = int(source.get("confirmations", 0) or 0)
+        except Exception:
+            confirmations = 0
+        blockhash = source.get("blockhash") or ""
+        blockheight = source.get("height", source.get("blockheight"))
+        if blockheight is None and blockhash:
+            try:
+                block = self.rpc.getBlock(blockhash)
+                if isinstance(block, dict) and block.get("height") is not None:
+                    blockheight = int(block.get("height"))
+            except Exception:
+                pass
+        return {
+            "confirmations": confirmations,
+            "blockhash": blockhash,
+            "blockheight": blockheight,
+            "blockindex": source.get("blockindex"),
+            "time": source.get("time") or source.get("blocktime"),
+            "blocktime": source.get("blocktime"),
+            "timereceived": source.get("timereceived") or source.get("time") or source.get("blocktime"),
+            "status": self._status_from_confirmations(confirmations),
+            "_cache_meta": {"blockheight": blockheight},
+        }
+
+    def _shielded_receive_entry(
+        self,
+        txid: str,
+        address: str,
+        amount: float,
+        *,
+        note: dict | None = None,
+        metadata: dict | None = None,
+        details: dict | None = None,
+    ) -> dict | None:
+        txid = str(txid or "").strip()
+        address = str(address or "").strip()
+        try:
+            amount = float(amount)
+        except Exception:
+            amount = 0.0
+        if not txid or not address or amount <= 0:
+            return None
+
+        meta = dict(metadata or {})
+        cache_meta = dict(meta.pop("_cache_meta", {}) or {})
+        if details is not None:
+            cache_meta["details"] = details
+        entry = {
+            "txid": txid,
+            "category": "receive",
+            "address": address,
+            "amount": amount,
+            **meta,
+            "_cache_meta": cache_meta,
+            "_synthetic": "shielded_receive",
+        }
+        if isinstance(note, dict):
+            for key in ("memoStr", "memo", "outindex", "output", "jsindex", "jsoutindex", "change"):
+                if key in note:
+                    entry[key] = note.get(key)
+            entry["_shielded_note"] = note
+        return entry
+
+    def _shielded_receive_entries_from_view(self, tx: dict, details: dict | None) -> list[dict]:
+        if not isinstance(details, dict):
+            return []
+        txid = str(details.get("txid") or tx.get("txid", "") or "").strip()
+        if not txid:
+            return []
+        metadata = {
+            "confirmations": int(tx.get("confirmations", 0) or 0),
+            "blockhash": tx.get("blockhash", ""),
+            "blockheight": tx.get("blockheight"),
+            "blockindex": tx.get("blockindex"),
+            "time": tx.get("time") or tx.get("blocktime"),
+            "blocktime": tx.get("blocktime"),
+            "timereceived": tx.get("timereceived") or tx.get("time") or tx.get("blocktime"),
+        }
+        metadata["status"] = self._status_from_confirmations(int(metadata["confirmations"] or 0))
+        metadata["_cache_meta"] = dict((tx.get("_cache_meta") or {}), details=details)
+
+        entries: list[dict] = []
+        for output in details.get("outputs", []) or []:
+            if output.get("outgoing") is True:
+                continue
+            entry = self._shielded_receive_entry(
+                txid,
+                str(output.get("address", "") or ""),
+                self._shielded_item_amount(output),
+                note=output,
+                metadata=metadata,
+                details=details,
+            )
+            if entry is not None:
+                entries.append(entry)
+        return entries
+
     def _store_cache_snapshot(self, data: dict, job_type: str = "refresh") -> None:
         if self.cache is None:
             return
@@ -405,6 +554,8 @@ class RefreshWorker(QThread):
                 pass
 
         z_view_count = 0
+        enriched: list[dict] = []
+        seen_entries = {self._tx_entry_key(tx) for tx in txs}
         for tx in txs:
             meta = tx.setdefault("_cache_meta", {})
             blockhash = tx.get("blockhash")
@@ -412,13 +563,65 @@ class RefreshWorker(QThread):
                 tx["blockheight"] = block_heights[blockhash]
                 meta["blockheight"] = block_heights[blockhash]
             txid = tx.get("txid")
+            details = None
             if txid and (not tx.get("address") or tx.get("category") == "send") and z_view_count < 20:
                 try:
-                    meta["details"] = self.rpc.z_viewTransaction(txid)
+                    details = self.rpc.z_viewTransaction(txid)
+                    meta["details"] = details
                     z_view_count += 1
                 except Exception:
                     pass
-        return txs
+            enriched.append(tx)
+            for shielded_entry in self._shielded_receive_entries_from_view(tx, details):
+                key = self._tx_entry_key(shielded_entry)
+                if key in seen_entries:
+                    continue
+                seen_entries.add(key)
+                enriched.append(shielded_entry)
+        return enriched
+
+    def _merge_shielded_received_transactions(self, txs: list, z_addrs: list[str]) -> list:
+        if not z_addrs:
+            return txs
+        rows = list(txs or [])
+        seen_entries = {self._tx_entry_key(tx) for tx in rows}
+        metadata_cache: dict[str, dict] = {}
+        details_cache: dict[str, dict | None] = {}
+
+        for zaddr in z_addrs:
+            try:
+                notes = self.rpc.z_listReceivedByAddress(zaddr, 0) or []
+            except Exception:
+                continue
+            for note in notes:
+                if not isinstance(note, dict):
+                    continue
+                txid = str(note.get("txid", "") or "").strip()
+                if not txid:
+                    continue
+                if txid not in metadata_cache:
+                    metadata_cache[txid] = self._node_tx_metadata(txid)
+                if txid not in details_cache:
+                    try:
+                        details_cache[txid] = self.rpc.z_viewTransaction(txid) or {}
+                    except Exception:
+                        details_cache[txid] = None
+                entry = self._shielded_receive_entry(
+                    txid,
+                    str(note.get("address") or zaddr),
+                    self._shielded_item_amount(note),
+                    note=note,
+                    metadata=metadata_cache[txid],
+                    details=details_cache[txid],
+                )
+                if entry is None:
+                    continue
+                key = self._tx_entry_key(entry)
+                if key in seen_entries:
+                    continue
+                seen_entries.add(key)
+                rows.append(entry)
+        return rows
 
     def _operation_transaction_from_node(self, op: dict) -> dict | None:
         txid = str(op.get("txid", "") or "").strip()
@@ -628,6 +831,7 @@ class RefreshWorker(QThread):
                 tx_snapshot_complete = (len(txs) < 200) if not self.force_full else (len(txs) < 2000)
                 txs = self._enrich_transactions(txs)
                 txs = self._merge_operation_transactions(txs)
+                txs = self._merge_shielded_received_transactions(txs, z_addrs)
             except RPCError as e:
                 if _is_reindex_err(e):
                     self._reindex_emit(info, chain, t_addrs, z_addrs, total_bal=total_bal)

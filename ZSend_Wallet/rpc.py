@@ -100,6 +100,9 @@ class BitcoinZRPC:
     def z_listUnspent(self, address: str, minconf: int = 0, maxconf: int = 9999999) -> list:
         return self.call("z_listunspent", [minconf, maxconf, True, [address]])
 
+    def z_listReceivedByAddress(self, address: str, minconf: int = 0) -> list:
+        return self.call("z_listreceivedbyaddress", [address, int(minconf)])
+
     def listTransactions(self, count: int, tx_from: int) -> list:
         return self.call("listtransactions", ["*", count, tx_from])
 
@@ -146,4 +149,3 @@ class BitcoinZRPC:
     def getBlock(self, blockhash: str) -> dict:     return self.call("getblock", [blockhash, 2])
     def z_viewTransaction(self, txid: str) -> dict: return self.call("z_viewtransaction", [txid])
     def stopNode(self):                             return self.call("stop", [])
-
