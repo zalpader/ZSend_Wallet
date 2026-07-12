@@ -489,11 +489,19 @@ def ensure_exportdir(path: Path = CONF_PATH, secure_dir: Path | None = None) -> 
     return export_path, changed
 
 
+def parse_rpc_port(value, default: int = _RPC_DEFAULT_PORT) -> int:
+    try:
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        return int(default)
+    return port if 1 <= port <= 65535 else int(default)
+
+
 def load_rpc_cfg() -> dict:
     c = ensure_conf()
     return {
         "host":       c.get("rpcbind", _RPC_DEFAULT_HOST),
-        "port":       int(c.get("rpcport", _RPC_DEFAULT_PORT)),
+        "port":       parse_rpc_port(c.get("rpcport"), _RPC_DEFAULT_PORT),
         "user":       c.get("rpcuser",     ""),
         "password":   c.get("rpcpassword", ""),
         "exportdir":  c.get("exportdir", ""),

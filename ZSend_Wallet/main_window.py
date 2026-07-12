@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import json
 import time
-from secrets import token_hex
 from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QLocale, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QIcon
+from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -23,7 +21,6 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
-    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
@@ -31,41 +28,40 @@ from PySide6.QtWidgets import (
 from .common import (
     CONF_PATH,
     DEVELOPER_TIP_ADDRESS,
-    _RUNNING_WORKERS,
     _is_z_addr,
     _track,
-    create_sensitive_text_file,
     ensure_exportdir,
     is_port_open,
     resource_path,
     tx_fingerprint,
 )
-from .rpc import BitcoinZRPC, RPCError
+from .rpc import BitcoinZRPC
 from .wallet_cache import WalletCache, btcz_to_zat, zat_to_float
-from .wallet_export import _sanitize_dump_basename, FullWalletExportWorker
-from .wallet_import import FullWalletImportWorker, read_recent_wallet_rescan_state
-from .workers import MaintenanceRestartWorker, NewAddressWorker, PollWorker, RefreshWorker, SendWorker, ShutdownWorker, StatusWorker
-from .dialogs import AboutDialog, BusyDialog, ConfigDialog, DiagDialog, ImportKeyDialog, KeyDisplayDialog, TxDetailDialog, _DraggableDialog, _ask_yes_no, _get_open_file_name, _get_save_file_name, _msg, _msg_critical, _msg_info
-from .helpers import _fmt_addr, _sort_addr_items, fmt_btcz, fmt_ts, tx_status_code
+from .workers import NewAddressWorker, PollWorker
+from .dialogs import AboutDialog, BusyDialog, ConfigDialog, DiagDialog, ImportKeyDialog, KeyDisplayDialog, TxDetailDialog, _ask_yes_no, _get_open_file_name, _get_save_file_name, _msg, _msg_critical, _msg_info
+from .helpers import _fmt_addr, _sort_addr_items, fmt_btcz
 from .locales import tr
 from .models import AddressTableModel, TransactionTableModel, _AddrBalanceDelegate, _FromCombo, mk_view
 from .ui import _CenteredTabWidget, mk_card, slbl
+from .refresh_flow import NodeState, RefreshController
+from .maintenance_flow import MaintenanceController
+from .wallet_transfer_flow import ImportFileError, WalletTransferController
+from .tray_flow import TrayController
+from .wallet_state import (
+    derive_busy_addresses,
+    fast_status_txids,
+    merge_tx_status_update,
+    success_operation_txids,
+    wallet_identity_candidate,
+    with_wallet_operation_receives,
+)
 from . import address_actions, send_flow, shutdown_flow
 
 MIN_NODE_FEE_BTCZ = 0.00001
 MAX_NODE_FEE_BTCZ = 0.1
 MAX_BTCZ_MONEY = 21_000_000_000
 WALLET_IDENTITY_STATE_KEY = "wallet_identity_address"
-TRAY_ON_CLOSE_SETTING_KEY = "minimize_to_tray_on_close"
-
-
-def wallet_identity_candidate(data: dict) -> str:
-    addresses = [
-        str(addr or "").strip()
-        for addr in list((data or {}).get("t_addrs", []) or []) + list((data or {}).get("z_addrs", []) or [])
-    ]
-    addresses = sorted({addr for addr in addresses if addr})
-    return addresses[0] if addresses else ""
+EMPTY_WALLET_IDENTITY = "__empty_wallet__"
 
 
 class BtcZAmountSpinBox(QDoubleSpinBox):
@@ -110,14 +106,11 @@ class MainWindow(QMainWindow):
         self._cached_txs: list      = []
         self._addr_balances: dict   = {}
         self._max_mode: bool        = False
-        self._refresh_running: bool = False
-        self._status_refresh_running: bool = False
-        self._status_rpc_failures: int = 0
-        self._had_balance: bool     = False
         self._tx_cache_key: str     = ""
         self._threads: list         = []
         self._pending_send: dict | None = None
         self._active_opid: str      = ""
+        self._polling_opids: set[str] = set()
         self._t_sort_mode: str      = 'balance_desc'
         self._z_sort_mode: str      = 'balance_desc'
         self._status_visual_state: str = ""
@@ -126,91 +119,58 @@ class MainWindow(QMainWindow):
         self._wallet_synced: bool = False
         self._busy_addresses: set[str] = set()
         self._rescan_status_active: bool = False
-        self._full_export_worker = None
-        self._full_import_worker = None
         self._busy_dialog = None
-        self._maintenance_worker = None
-        self._maintenance_dialog = None
-        self._temp_wallet_dump_path: Path | None = None
         self._force_real_exit = False
-        self._tray_icon: QSystemTrayIcon | None = None
-        self._tray_menu: QMenu | None = None
-        self._tray_available = QSystemTrayIcon.isSystemTrayAvailable()
-        self._minimize_to_tray_on_close = self._load_minimize_to_tray_setting()
         self._act_minimize_to_tray = None
         self._t_model = AddressTableModel(tr("dialogs.models.address"))
         self._z_model = AddressTableModel(tr("dialogs.main_window.tab_z"))
         self._tx_model = TransactionTableModel()
+        self._refresh_controller = RefreshController(
+            self.rpc,
+            self.cache,
+            self._fast_txids_for_refresh,
+            self,
+        )
+        self._refresh_controller.wallet_snapshot.connect(self._on_done)
+        self._refresh_controller.node_state.connect(self._render_node_state)
+        self._refresh_controller.fast_tx_updates.connect(self._apply_fast_tx_updates)
+        self._refresh_controller.reindexing.connect(self._render_node_state)
+        self._refresh_controller.refreshing_changed.connect(lambda _active: self._update_wallet_key_actions())
+        self._maintenance_controller = MaintenanceController(self.rpc, self)
+        self._maintenance_controller.status.connect(self._on_node_maintenance_status)
+        self._maintenance_controller.progress.connect(self._on_node_maintenance_progress)
+        self._maintenance_controller.finished.connect(self._on_node_maintenance_done)
+        self._maintenance_controller.failed.connect(self._on_node_maintenance_error)
+        self._maintenance_controller.active_changed.connect(lambda _active: self._update_wallet_key_actions())
+        self._transfer_controller = WalletTransferController(self.rpc, self)
+        self._transfer_controller.started.connect(self._on_wallet_transfer_started)
+        self._transfer_controller.export_finished.connect(self._on_full_wallet_export_done)
+        self._transfer_controller.import_finished.connect(self._on_full_wallet_import_done)
+        self._transfer_controller.failed.connect(self._on_wallet_transfer_error)
+        self._transfer_controller.active_changed.connect(lambda _active: self._update_wallet_key_actions())
+        self._tray_controller = TrayController(
+            self.cache,
+            resource_path("icons/bitcoinz.ico"),
+            parent=self,
+        )
+        self._tray_controller.open_requested.connect(self._bring_to_front)
+        self._tray_controller.stop_exit_requested.connect(self._quit_and_stop)
+        self._tray_controller.exit_requested.connect(self._exit_gui)
 
         self.raise_window.connect(self._bring_to_front)
         self._build_menu(); self._build_ui(); self._build_sb()
-        self._build_tray()
+        self._tray_controller.show()
         app = QApplication.instance()
         if app is not None:
-            app.aboutToQuit.connect(self._hide_tray_icon)
+            app.aboutToQuit.connect(self._tray_controller.hide)
         self._load_cached_snapshot()
 
-        self._timer = QTimer(self); self._timer.timeout.connect(self.refresh)
-        self._timer.start(30_000)
-        self._status_timer = QTimer(self)
-        self._status_timer.timeout.connect(self.refresh_status)
-        self._status_timer.start(2_000)
-        self._reconcile_timer = QTimer(self)
-        self._reconcile_timer.timeout.connect(lambda: self.refresh(force_full=True))
-        self._reconcile_timer.start(300_000)
-        self.refresh()
-        self.refresh_status()
+        self._refresh_controller.start()
+        send_flow.resume_pending_operations(self)
 
     def _bring_to_front(self):
         self.setWindowState(Qt.WindowState.WindowActive)
         self.show(); self.raise_(); self.activateWindow()
-
-    def _load_minimize_to_tray_setting(self) -> bool:
-        if self.cache is None:
-            return True
-        try:
-            return bool(self.cache.get_app_setting(TRAY_ON_CLOSE_SETTING_KEY, True))
-        except Exception:
-            return True
-
-    def _set_minimize_to_tray_on_close(self, checked: bool):
-        self._minimize_to_tray_on_close = bool(checked)
-        if self.cache is not None:
-            try:
-                self.cache.set_app_setting(TRAY_ON_CLOSE_SETTING_KEY, self._minimize_to_tray_on_close)
-            except Exception:
-                pass
-
-    def _should_minimize_to_tray(self) -> bool:
-        return (
-            bool(self._tray_available)
-            and bool(self._minimize_to_tray_on_close)
-            and self._tray_icon is not None
-            and self._tray_icon.isVisible()
-        )
-
-    def _build_tray(self):
-        if not self._tray_available:
-            return
-        icon = QIcon(resource_path("icons/bitcoinz.ico"))
-        self._tray_menu = QMenu(self)
-        self._tray_menu.addAction(tr("dialogs.main_window.tray_open_wallet"), self._bring_to_front)
-        self._tray_menu.addAction(tr("dialogs.main_window.tray_stop_node_exit"), self._quit_and_stop)
-        self._tray_menu.addAction(tr("dialogs.main_window.tray_exit"), self._exit_gui)
-
-        self._tray_icon = QSystemTrayIcon(icon, self)
-        self._tray_icon.setToolTip(tr("dialogs.ui.app_title"))
-        self._tray_icon.setContextMenu(self._tray_menu)
-        self._tray_icon.activated.connect(self._on_tray_activated)
-        self._tray_icon.show()
-
-    def _on_tray_activated(self, reason):
-        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
-            self._bring_to_front()
-
-    def _hide_tray_icon(self):
-        if self._tray_icon is not None:
-            self._tray_icon.hide()
 
     def _exit_gui(self):
         self._force_real_exit = True
@@ -218,58 +178,16 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
     def closeEvent(self, event):
-        if not self._force_real_exit and self._should_minimize_to_tray():
+        if not self._force_real_exit and self._tray_controller.should_hide_on_close():
             event.ignore()
             self.hide()
             return
-        self._hide_tray_icon()
-        self._timer.stop()
-        if hasattr(self, "_status_timer"):
-            self._status_timer.stop()
-        if hasattr(self, "_reconcile_timer"):
-            self._reconcile_timer.stop()
-        workers = list(_RUNNING_WORKERS)
-        fast_sync_workers = (RefreshWorker, StatusWorker)
-        for w in workers:
-            if (
-                w is self._maintenance_worker
-                and getattr(w, "mode", "") == "reindex"
-                and hasattr(w, "detach")
-            ):
-                try:
-                    w.detach()
-                except Exception:
-                    pass
-                continue
-            if hasattr(w, 'stop'):
-                try:
-                    w.stop()
-                except Exception:
-                    pass
-            else:
-                try:
-                    w.requestInterruption()
-                except Exception:
-                    pass
-        deadline = time.monotonic() + 0.8
-        for w in workers:
-            try:
-                if not w.isRunning():
-                    continue
-                remaining_ms = int(max(0.0, deadline - time.monotonic()) * 1000)
-                if remaining_ms <= 0:
-                    break
-                w.wait(remaining_ms)
-            except Exception:
-                pass
-        for w in workers:
-            if isinstance(w, fast_sync_workers):
-                try:
-                    if w.isRunning():
-                        w.terminate()
-                        w.wait(200)
-                except Exception:
-                    pass
+        self._tray_controller.hide()
+        maintenance_worker = self._maintenance_controller.worker
+        self._maintenance_controller.detach_for_exit()
+        self._transfer_controller.stop()
+        self._refresh_controller.stop(800)
+        shutdown_flow.stop_gui_workers(exclude=(maintenance_worker,), timeout_seconds=0.8)
         super().closeEvent(event)
 
     def _build_menu(self):
@@ -291,9 +209,9 @@ class MainWindow(QMainWindow):
         sm.addSeparator()
         self._act_minimize_to_tray = QAction(tr("dialogs.main_window.minimize_to_tray_on_close"), self)
         self._act_minimize_to_tray.setCheckable(True)
-        self._act_minimize_to_tray.setChecked(self._minimize_to_tray_on_close)
-        self._act_minimize_to_tray.setEnabled(self._tray_available)
-        self._act_minimize_to_tray.toggled.connect(self._set_minimize_to_tray_on_close)
+        self._act_minimize_to_tray.setChecked(self._tray_controller.minimize_on_close)
+        self._act_minimize_to_tray.setEnabled(self._tray_controller.available)
+        self._act_minimize_to_tray.toggled.connect(self._tray_controller.set_minimize_on_close)
         sm.addAction(self._act_minimize_to_tray)
         hm = mb.addMenu(tr("dialogs.main_window.help_menu"))
         self._act(hm, tr("dialogs.main_window.full_diagnostics"), self._open_diag)
@@ -312,10 +230,9 @@ class MainWindow(QMainWindow):
     def _wallet_key_actions_enabled(self) -> bool:
         return (
             bool(getattr(self, "_wallet_synced", False))
-            and not self._refresh_running
+            and not self._refresh_controller.refreshing
             and not self._rescan_status_active
-            and self._full_export_worker is None
-            and self._full_import_worker is None
+            and not self._transfer_controller.active
         )
 
     def _update_wallet_key_actions(self):
@@ -324,7 +241,7 @@ class MainWindow(QMainWindow):
             action = getattr(self, name, None)
             if action is not None:
                 action.setEnabled(enabled)
-        maintenance_enabled = self._maintenance_worker is None
+        maintenance_enabled = not self._maintenance_controller.active
         rescan_action = getattr(self, "_act_rescan_node", None)
         if rescan_action is not None:
             rescan_action.setEnabled(enabled and maintenance_enabled)
@@ -650,170 +567,6 @@ class MainWindow(QMainWindow):
         spin = " \U0001F504" if (has_transparent_pending or has_shielded_pending) else ""
         self.card_total._title_label.setText((tr("dialogs.main_window.card_total") + spin).upper())
 
-    def _derive_busy_addresses(self, data: dict) -> set[str]:
-        busy: set[str] = set()
-        live_txid_confirms: dict[str, int] = {}
-        live_txid_status: dict[str, str] = {}
-        inactive_tx_statuses = {"failed", "expired", "conflicted", "reorged", "stale"}
-        for tx in data.get("txs", []) or []:
-            try:
-                confirms = int(tx.get("confirmations", 0) or 0)
-            except Exception:
-                confirms = 0
-            txid = str(tx.get("txid", "") or "").strip()
-            tx_status = str(tx.get("status", "") or "").strip().lower()
-            if txid:
-                live_txid_confirms[txid] = confirms
-                live_txid_status[txid] = tx_status
-            if tx_status in inactive_tx_statuses or confirms < 0:
-                continue
-            if confirms > 0:
-                continue
-            addr = str(tx.get("address", "") or "").strip()
-            if addr:
-                busy.add(addr)
-            for entry in tx.get("_entries", []) or []:
-                entry_addr = str(entry.get("address", "") or "").strip()
-                if entry_addr:
-                    busy.add(entry_addr)
-        pending_from = str((self._pending_send or {}).get("from", "") or "").strip()
-        if pending_from and self._active_opid:
-            busy.add(pending_from)
-        if self.cache is not None:
-            try:
-                for op in self.cache.list_operations(limit=200):
-                    from_addr = str(op.get("from_address", "") or "").strip()
-                    to_addr = str(op.get("to_address", "") or "").strip()
-                    if not from_addr:
-                        continue
-                    status = str(op.get("status", "") or "").strip().lower()
-                    txid = str(op.get("txid", "") or "").strip()
-                    if status in {"submitted", "queued", "executing"}:
-                        busy.add(from_addr)
-                        if to_addr:
-                            busy.add(to_addr)
-                        continue
-                    if status == "success":
-                        if not txid:
-                            busy.add(from_addr)
-                            continue
-                        if live_txid_status.get(txid, "") in inactive_tx_statuses:
-                            continue
-                        confirms = live_txid_confirms.get(txid)
-                        if confirms is None and self.cache is not None:
-                            cached_entries = self.cache.get_transaction_entries(txid)
-                            cached_statuses = {
-                                str(row.get("status", "") or "").strip().lower()
-                                for row in cached_entries
-                            }
-                            if cached_statuses & inactive_tx_statuses:
-                                continue
-                            cached_confirms = [
-                                int(row.get("confirmations", 0) or 0)
-                                for row in cached_entries
-                            ]
-                            if cached_confirms:
-                                confirms = max(cached_confirms)
-                        if confirms is None or confirms <= 0:
-                            busy.add(from_addr)
-                            if to_addr:
-                                busy.add(to_addr)
-            except Exception:
-                pass
-        return busy
-
-    def _success_operation_txids(self) -> set[str]:
-        if self.cache is None:
-            return set()
-        txids: set[str] = set()
-        try:
-            for op in self.cache.list_operations(status="success", limit=200):
-                txid = str(op.get("txid", "") or "").strip()
-                if txid:
-                    txids.add(txid)
-        except Exception:
-            pass
-        return txids
-
-    def _fast_status_txids(self) -> list[str]:
-        tracked: list[str] = []
-        seen: set[str] = set()
-        inactive = {"failed", "expired", "conflicted", "reorged", "stale"}
-
-        def add(txid: str):
-            txid = str(txid or "").strip()
-            if txid and txid not in seen:
-                seen.add(txid)
-                tracked.append(txid)
-
-        if self._active_opid and self.cache is not None:
-            try:
-                for op in self.cache.list_operations(limit=50):
-                    if str(op.get("opid", "") or "") != self._active_opid:
-                        continue
-                    add(str(op.get("txid", "") or ""))
-                    break
-            except Exception:
-                pass
-
-        for tx in list(self._cached_txs or []) + list((self._data or {}).get("txs", []) or []):
-            txid = str(tx.get("txid", "") or "").strip()
-            if not txid:
-                continue
-            status = tx_status_code(tx)
-            try:
-                confirms = int(tx.get("confirmations", 0) or 0)
-            except Exception:
-                confirms = 0
-            if status not in inactive and confirms <= 0:
-                add(txid)
-
-        if self.cache is not None:
-            try:
-                for op in self.cache.list_operations(limit=200):
-                    txid = str(op.get("txid", "") or "").strip()
-                    status = str(op.get("status", "") or "").strip().lower()
-                    if status in {"submitted", "queued", "executing"}:
-                        add(txid)
-                        continue
-                    if not txid or status != "success":
-                        continue
-                    entries = self.cache.get_transaction_entries(txid)
-                    if not entries:
-                        continue
-                    try:
-                        max_confirms = max(int(row.get("confirmations", 0) or 0) for row in entries)
-                    except Exception:
-                        max_confirms = 0
-                    if max_confirms <= 0:
-                        add(txid)
-            except Exception:
-                pass
-
-        return tracked
-
-    @staticmethod
-    def _merge_tx_status_update(row: dict, update: dict) -> bool:
-        changed = False
-        for field in (
-            "confirmations", "status", "blockhash", "blockheight", "blockindex",
-            "time", "blocktime", "timereceived", "fee",
-        ):
-            if field not in update:
-                continue
-            value = update.get(field)
-            if value in (None, ""):
-                continue
-            if field in {"confirmations", "blockheight", "blockindex", "time", "blocktime", "timereceived"}:
-                try:
-                    value = int(value)
-                except Exception:
-                    pass
-            if row.get(field) != value:
-                row[field] = value
-                changed = True
-        return changed
-
     def _apply_fast_block_state(self, chain: dict, tx_updates: list[dict]):
         if not self._data:
             return
@@ -841,10 +594,10 @@ class MainWindow(QMainWindow):
             if not update:
                 continue
             found_txids.add(txid)
-            if self._merge_tx_status_update(row, update):
+            if merge_tx_status_update(row, update):
                 changed_txids.add(txid)
 
-        operation_txids = self._success_operation_txids()
+        operation_txids = success_operation_txids(self.cache)
         for txid, update in updates_by_txid.items():
             if txid in found_txids or txid not in operation_txids:
                 continue
@@ -877,12 +630,17 @@ class MainWindow(QMainWindow):
                     pass
 
         old_busy = set(self._busy_addresses)
-        self._busy_addresses = self._derive_busy_addresses(self._data)
+        self._busy_addresses = derive_busy_addresses(
+            self._data,
+            self.cache,
+            pending_send=self._pending_send,
+            active_opid=self._active_opid,
+        )
 
         new_t_bal = self._data.get("t_balances", {}) or {}
         new_z_bal = self._data.get("z_balances", {}) or {}
         own_addresses = set(self._data.get("t_addrs", []) or []) | set(self._data.get("z_addrs", []) or [])
-        self._cached_txs = self._txs_with_wallet_operation_receives(rows, own_addresses)
+        self._cached_txs = with_wallet_operation_receives(rows, own_addresses, self.cache)
         new_key = tx_fingerprint(self._cached_txs)
         if new_key != self._tx_cache_key:
             self._tx_cache_key = new_key
@@ -902,70 +660,8 @@ class MainWindow(QMainWindow):
             )
             self._update_send_btn()
 
-    def _txs_with_wallet_operation_receives(self, txs: list, own_addresses: set[str]) -> list:
-        rows = list(txs or [])
-        if self.cache is None or not own_addresses:
-            return rows
-        existing = {
-            (str(tx.get("txid", "") or ""), str(tx.get("category", "") or ""), str(tx.get("address", "") or ""))
-            for tx in rows
-        }
-        by_txid = {str(tx.get("txid", "") or ""): tx for tx in rows if tx.get("txid")}
-        try:
-            operations = self.cache.list_operations(limit=500)
-        except Exception:
-            return rows
-        for op in operations:
-            txid = str(op.get("txid", "") or "").strip()
-            from_addr = str(op.get("from_address", "") or "").strip()
-            to_addr = str(op.get("to_address", "") or "").strip()
-            status = str(op.get("status", "") or "")
-            if not txid or status != "success":
-                continue
-            base = by_txid.get(txid) or {}
-            amount_zat = int(op.get("amount_zat") or 0)
-            if amount_zat <= 0:
-                continue
-            common = {
-                "txid": txid,
-                "confirmations": int(base.get("confirmations", 0) or 0),
-                "blockhash": base.get("blockhash", ""),
-                "blockheight": base.get("blockheight"),
-                "blockindex": base.get("blockindex"),
-                "time": base.get("time") or base.get("blocktime") or base.get("timereceived") or op.get("created_at"),
-                "blocktime": base.get("blocktime"),
-                "timereceived": base.get("timereceived") or op.get("created_at"),
-                "created_at": op.get("created_at"),
-                "status": base.get("status", ""),
-            }
-            if from_addr in own_addresses:
-                key = (txid, "send", from_addr)
-                has_send = any(str(tx.get("txid", "") or "") == txid and tx.get("category") == "send" for tx in rows)
-                if key not in existing and not has_send:
-                    fee_zat = int(op.get("fee_zat") or 0)
-                    synthetic = {
-                        **common,
-                        "category": "send",
-                        "address": from_addr,
-                        "amount": -zat_to_float(amount_zat),
-                        "fee": -zat_to_float(fee_zat) if fee_zat else None,
-                        "_synthetic": "own_operation_send",
-                    }
-                    rows.append(synthetic)
-                    existing.add(key)
-            if to_addr in own_addresses:
-                key = (txid, "receive", to_addr)
-                if key not in existing:
-                    synthetic = {
-                        **common,
-                        "category": "receive",
-                        "address": to_addr,
-                        "amount": zat_to_float(amount_zat),
-                        "_synthetic": "own_operation_receive",
-                    }
-                    rows.append(synthetic)
-                    existing.add(key)
-        return rows
+    def _apply_fast_tx_updates(self, updates):
+        self._apply_fast_block_state({}, list(updates or []))
 
     def _update_memo_visibility(self):
         allow_memo = _is_z_addr(self.e_to.text().strip())
@@ -1040,17 +736,23 @@ class MainWindow(QMainWindow):
         except Exception:
             return
         self._apply_wallet_data(data, cached=True)
+        self._refresh_controller.note_wallet_snapshot(data)
 
     def clear_wallet_cache(self, *, refresh: bool = True):
         if self.cache is None:
             return
         self.cache.clear_runtime_cache()
+        self._refresh_controller.clear_wallet_context()
         self._data = {}
         self._cached_txs = []
         self._addr_balances = {}
         self._busy_addresses = set()
         self._tx_cache_key = ""
         self._active_opid = ""
+        for worker in list(self._threads):
+            if isinstance(worker, PollWorker) and hasattr(worker, "stop"):
+                worker.stop()
+        self._polling_opids.clear()
         self._pending_send = None
         self.lbl_total.setText("0")
         self.lbl_priv.setText("0")
@@ -1070,9 +772,7 @@ class MainWindow(QMainWindow):
     def _sync_wallet_cache_identity(self, data: dict) -> bool:
         if self.cache is None:
             return False
-        current = wallet_identity_candidate(data)
-        if not current:
-            return False
+        current = wallet_identity_candidate(data) or EMPTY_WALLET_IDENTITY
         current_addresses = {
             str(addr or "").strip()
             for addr in list((data or {}).get("t_addrs", []) or []) + list((data or {}).get("z_addrs", []) or [])
@@ -1080,7 +780,12 @@ class MainWindow(QMainWindow):
         }
         try:
             stored = str(self.cache.get_state(WALLET_IDENTITY_STATE_KEY, "") or "").strip()
-            if stored and stored not in current_addresses:
+            identity_changed = bool(
+                stored
+                and stored != current
+                and (current == EMPTY_WALLET_IDENTITY or stored not in current_addresses)
+            )
+            if identity_changed:
                 self.cache.clear_runtime_cache()
                 self.cache.store_refresh_snapshot(data)
                 self.cache.set_state(WALLET_IDENTITY_STATE_KEY, current)
@@ -1093,7 +798,12 @@ class MainWindow(QMainWindow):
 
     def _apply_wallet_data(self, data: dict, cached: bool = False):
         self._data = data
-        self._busy_addresses = self._derive_busy_addresses(data)
+        self._busy_addresses = derive_busy_addresses(
+            data,
+            self.cache,
+            pending_send=self._pending_send,
+            active_opid=self._active_opid,
+        )
         info  = data.get("info",  {}); chain = data.get("chain", {})
         blocks = info.get("blocks", "-"); peers = info.get("connections", "-")
         try: self._cur_blocks = int(blocks)
@@ -1147,9 +857,6 @@ class MainWindow(QMainWindow):
         self.lbl_total.setText(fmt_btcz(total_val))
         self.lbl_priv.setText(fmt_btcz(priv_val))
         self.lbl_transp.setText(fmt_btcz(transp_val))
-        if total_val > 0:
-            self._had_balance = True
-
         self._fill_t_table(new_t_bal)
         self._fill_z_table(new_z_bal)
 
@@ -1162,7 +869,7 @@ class MainWindow(QMainWindow):
         self._update_summary()
 
         own_addresses = set(data.get("t_addrs", []) or []) | set(data.get("z_addrs", []) or [])
-        self._cached_txs = self._txs_with_wallet_operation_receives(data.get("txs", []), own_addresses)
+        self._cached_txs = with_wallet_operation_receives(data.get("txs", []), own_addresses, self.cache)
         new_key = tx_fingerprint(self._cached_txs)
         if cached:
             self._tx_cache_key = new_key
@@ -1170,21 +877,6 @@ class MainWindow(QMainWindow):
         elif new_key != self._tx_cache_key:
             self._tx_cache_key = new_key
             self._fill_tx(self._cached_txs)
-
-    def _row_addr(self, tbl, pos):
-        return address_actions.row_addr(self, tbl, pos)
-
-    def _selected_addr(self, tbl) -> str:
-        return address_actions.selected_addr(self, tbl)
-
-    def _copy_selected_address(self, tbl):
-        address_actions.copy_selected_address(self, tbl)
-
-    def _show_selected_address_qr(self, tbl):
-        address_actions.show_selected_address_qr(self, tbl)
-
-    def _prefill_send(self, addr):
-        address_actions.prefill_send(self, addr)
 
     def _open_tip_for_developer(self):
         self.tabs.setCurrentIndex(2)
@@ -1312,7 +1004,7 @@ class MainWindow(QMainWindow):
     def _update_send_btn(self):
         if not hasattr(self, 'btn_send'):
             return
-        if getattr(self, "_active_opid", ""):
+        if getattr(self, "_active_opid", "") or getattr(self, "_polling_opids", set()):
             self.btn_send.setEnabled(False)
             self.btn_send.setToolTip("")
             return
@@ -1365,22 +1057,16 @@ class MainWindow(QMainWindow):
         self.lbl_sum_total.setText(f"{fmt_btcz(zat_to_float(amt_zat + fee_zat))} BTCZ")
         self._update_send_btn()
 
-    def _show_address_qr(self, addr: str):
-        address_actions.show_address_qr(self, addr)
-
     def _t_ctx(self, pos):
         address_actions.t_context_menu(self, pos)
 
     def _z_ctx(self, pos):
         address_actions.z_context_menu(self, pos)
 
-    def _export_key(self, addr: str, is_z: bool):
-        address_actions.export_key(self, addr, is_z)
-
     def _import_key(self):
-        self._timer.stop()
+        self._refresh_controller.pause_wallet_refresh()
         ImportKeyDialog(self, self.rpc, self.cache).exec()
-        self._timer.start(30_000)
+        self._refresh_controller.resume_wallet_refresh()
         self.refresh(force_full=True)
 
     def _ensure_export_support(self, action_label: str) -> Path | None:
@@ -1397,16 +1083,6 @@ class MainWindow(QMainWindow):
             )
             return None
         return export_dir
-
-    def _cleanup_temp_wallet_dump(self):
-        if not self._temp_wallet_dump_path:
-            return
-        try:
-            if self._temp_wallet_dump_path.exists():
-                self._temp_wallet_dump_path.unlink()
-        except Exception:
-            pass
-        self._temp_wallet_dump_path = None
 
     def _export_full_wallet_keys(self):
         if not self._wallet_key_actions_enabled():
@@ -1432,32 +1108,12 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        dump_basename = _sanitize_dump_basename(f"zsendexport{token_hex(16)}")
-        self._busy_dialog = BusyDialog(
-            self,
-            tr("dialogs.main_window.export_full_wallet_keys"),
-            tr("dialogs.main_window.busy_export_message"),
-        )
-        self._full_export_worker = FullWalletExportWorker(self.rpc, export_dir, dump_basename)
-        self._full_export_worker.done.connect(lambda payload: self._on_full_wallet_export_done(payload, Path(path)))
-        self._full_export_worker.error.connect(self._on_full_wallet_export_error)
-        self._update_wallet_key_actions()
-        _track(self._full_export_worker).start()
-        self._busy_dialog.exec()
+        self._transfer_controller.start_export(export_dir, Path(path))
 
-    def _on_full_wallet_export_done(self, payload: dict, json_path: Path):
-        try:
-            json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        except Exception as e:
-            self._on_full_wallet_export_error(str(e))
-            return
-        if self._busy_dialog is not None:
-            self._busy_dialog.mark_finished()
-            self._busy_dialog.accept()
-            self._busy_dialog = None
-        self._full_export_worker = None
-        self._update_wallet_key_actions()
-        summary = payload.get("summary") or {}
+    def _on_full_wallet_export_done(self, result: dict):
+        self._close_wallet_transfer_dialog()
+        summary = result.get("summary") or {}
+        json_path = Path(result.get("path"))
         _msg_info(
             self,
             tr("dialogs.main_window.export_complete"),
@@ -1469,22 +1125,9 @@ class MainWindow(QMainWindow):
             ),
         )
 
-    def _on_full_wallet_export_error(self, message: str):
-        if self._busy_dialog is not None:
-            self._busy_dialog.mark_finished()
-            self._busy_dialog.accept()
-            self._busy_dialog = None
-        self._full_export_worker = None
-        self._update_wallet_key_actions()
-        hint = ""
-        if "exportdir" in message.lower():
-            hint = "\n\nFull wallet export needs the node started with -exportdir or exportdir in bitcoinz.conf."
-        _msg_critical(self, tr("dialogs.main_window.export_failed"), f"{message}{hint}")
-
     def _import_wallet_keys_file(self):
         if not self._wallet_key_actions_enabled():
             return
-        self._cleanup_temp_wallet_dump()
         path, _ = _get_open_file_name(
             self,
             tr("dialogs.main_window.import_wallet_keys_file"),
@@ -1494,16 +1137,15 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        except Exception as e:
-            _msg_critical(self, tr("dialogs.main_window.import_failed"), tr("dialogs.main_window.import_json_read_error", error=e))
-            return
-        if payload.get("format") != "zsend_wallet_export_v1":
-            _msg_critical(self, tr("dialogs.main_window.import_failed"), tr("dialogs.main_window.unsupported_export"))
-            return
-        dump_text = str(payload.get("node_dump_text") or "").strip()
-        if not dump_text:
-            _msg_critical(self, tr("dialogs.main_window.import_failed"), tr("dialogs.main_window.missing_dump_data"))
+            self._transfer_controller.prepare_import(Path(path))
+        except ImportFileError as exc:
+            messages = {
+                "read": tr("dialogs.main_window.import_json_read_error", error=exc.detail),
+                "unsupported": tr("dialogs.main_window.unsupported_export"),
+                "missing_dump": tr("dialogs.main_window.missing_dump_data"),
+                "busy": tr("dialogs.main_window.busy_import_message"),
+            }
+            _msg_critical(self, tr("dialogs.main_window.import_failed"), messages.get(exc.kind, str(exc)))
             return
         if not _ask_yes_no(
             self,
@@ -1513,39 +1155,12 @@ class MainWindow(QMainWindow):
             no_text=tr("dialogs.address_actions.cancel"),
             kind="warning",
         ):
+            self._transfer_controller.discard_prepared_import()
             return
-        try:
-            self._temp_wallet_dump_path = create_sensitive_text_file(
-                "zsend_import_",
-                ".dump",
-                dump_text + "\n",
-            )
-            dump_text = ""
-            payload = {}
-        except Exception as e:
-            _msg_critical(self, tr("dialogs.main_window.import_failed"), str(e))
-            self._temp_wallet_dump_path = None
-            return
-        self._busy_dialog = BusyDialog(
-            self,
-            tr("dialogs.main_window.import_wallet_keys_file"),
-            tr("dialogs.main_window.busy_import_message"),
-        )
-        self._full_import_worker = FullWalletImportWorker(self.rpc, self._temp_wallet_dump_path)
-        self._full_import_worker.done.connect(self._on_full_wallet_import_done)
-        self._full_import_worker.error.connect(self._on_full_wallet_import_error)
-        self._update_wallet_key_actions()
-        _track(self._full_import_worker).start()
-        self._busy_dialog.exec()
+        self._transfer_controller.start_import()
 
     def _on_full_wallet_import_done(self):
-        self._cleanup_temp_wallet_dump()
-        if self._busy_dialog is not None:
-            self._busy_dialog.mark_finished()
-            self._busy_dialog.accept()
-            self._busy_dialog = None
-        self._full_import_worker = None
-        self._update_wallet_key_actions()
+        self._close_wallet_transfer_dialog()
         _msg_info(
             self,
             tr("dialogs.main_window.import_complete"),
@@ -1553,27 +1168,50 @@ class MainWindow(QMainWindow):
         )
         self.refresh(force_full=True)
 
-    def _on_full_wallet_import_error(self, message: str):
-        self._cleanup_temp_wallet_dump()
+    def _on_wallet_transfer_started(self, operation: str):
+        if operation == "export":
+            title = tr("dialogs.main_window.export_full_wallet_keys")
+            message = tr("dialogs.main_window.busy_export_message")
+        else:
+            title = tr("dialogs.main_window.import_wallet_keys_file")
+            message = tr("dialogs.main_window.busy_import_message")
+        self._busy_dialog = BusyDialog(self, title, message)
+        self._busy_dialog.exec()
+
+    def _close_wallet_transfer_dialog(self):
         if self._busy_dialog is not None:
             self._busy_dialog.mark_finished()
             self._busy_dialog.accept()
             self._busy_dialog = None
-        self._full_import_worker = None
-        self._update_wallet_key_actions()
-        _msg_critical(self, tr("dialogs.main_window.import_failed"), message)
+
+    def _on_wallet_transfer_error(self, operation: str, message: str):
+        self._close_wallet_transfer_dialog()
+        if operation == "export":
+            hint = ""
+            if "exportdir" in message.lower():
+                hint = "\n\n" + tr("dialogs.main_window.exportdir_required_hint")
+            _msg_critical(self, tr("dialogs.main_window.export_failed"), f"{message}{hint}")
+        else:
+            _msg_critical(self, tr("dialogs.main_window.import_failed"), message)
 
     def _open_cfg(self):
         dlg = ConfigDialog(self, self.rpc.host, self.rpc.port,
                            self.rpc.user, self.rpc.password, str(CONF_PATH))
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            h, p, u, pw = dlg.values(); self.rpc = BitcoinZRPC(h, p, u, pw); self.refresh(force_full=True)
+            h, p, u, pw = dlg.values()
+            self._set_rpc_client(BitcoinZRPC(h, p, u, pw), refresh=True)
+
+    def _set_rpc_client(self, rpc: BitcoinZRPC, *, refresh: bool = True):
+        self.rpc = rpc
+        self._maintenance_controller.set_rpc(rpc)
+        self._transfer_controller.set_rpc(rpc)
+        self._refresh_controller.set_rpc(rpc, refresh=refresh)
 
     def _open_diag(self):  DiagDialog(self, self.rpc, self.cache).exec()
 
     def _start_node_maintenance(self, mode: str):
         mode = str(mode or "").strip().lower()
-        if mode not in {"rescan", "reindex"} or self._maintenance_worker is not None:
+        if mode not in {"rescan", "reindex"} or self._maintenance_controller.active:
             return
         if mode == "rescan":
             title = tr("dialogs.main_window.rescan_confirm_title")
@@ -1592,42 +1230,18 @@ class MainWindow(QMainWindow):
         ):
             return
 
-        self._timer.stop()
-        self._status_timer.stop()
-        self._reconcile_timer.stop()
-        self._refresh_running = False
-        self._status_refresh_running = False
+        self._refresh_controller.pause_all()
         self.clear_wallet_cache(refresh=False)
         self._wallet_synced = False
         self._set_rescan_status_active(True)
         self._set_status_visual("syncing", "  " + title)
         self._set_sync_visual("syncing", value=0, text=self._sync_percent_text(0))
 
-        self._maintenance_dialog = None
-        self._maintenance_worker = MaintenanceRestartWorker(self.rpc, mode)
-        self._maintenance_worker.status.connect(self._on_node_maintenance_status)
-        self._maintenance_worker.progress.connect(self._on_node_maintenance_progress)
-        self._maintenance_worker.done.connect(self._on_node_maintenance_done)
-        self._maintenance_worker.error.connect(self._on_node_maintenance_error)
-        worker = self._maintenance_worker
-        self._maintenance_worker.finished.connect(lambda w=worker: self._remove_maintenance_worker(w))
-        self._threads.append(self._maintenance_worker)
         self._update_wallet_key_actions()
-        _track(self._maintenance_worker).start()
-        if self._maintenance_dialog is not None:
-            self._maintenance_dialog.exec()
-
-    def _remove_maintenance_worker(self, worker):
-        if worker in self._threads:
-            self._threads.remove(worker)
+        self._maintenance_controller.start(mode)
 
     def _restart_refresh_timers(self):
-        if not self._timer.isActive():
-            self._timer.start(30_000)
-        if not self._status_timer.isActive():
-            self._status_timer.start(2_000)
-        if not self._reconcile_timer.isActive():
-            self._reconcile_timer.start(300_000)
+        self._refresh_controller.resume()
 
     def _reindex_progress_text(self, payload: dict, fallback: str) -> str:
         phase = str(payload.get("phase", "") or "").strip()
@@ -1655,17 +1269,15 @@ class MainWindow(QMainWindow):
 
     def _on_node_maintenance_status(self, message: str):
         message = str(message or "").strip()
-        if getattr(self._maintenance_worker, "mode", "") == "reindex":
+        if self._maintenance_controller.mode == "reindex":
             if "synchronizing" in message.lower():
                 self._set_status_visual("syncing", "  " + tr("dialogs.main_window.synchronizing"))
             elif message:
                 self._set_status_visual("syncing", "  " + tr("dialogs.main_window.reindex_confirm_title"))
             return
-        if self._maintenance_dialog is not None and message:
-            self._maintenance_dialog.set_message(message)
         if message:
             self._set_status_visual("syncing", "  " + message)
-            if getattr(self._maintenance_worker, "mode", "") != "reindex":
+            if self._maintenance_controller.mode != "reindex":
                 self._set_sync_visual("syncing", value=0, text=self._sync_percent_text(0))
 
     def _on_node_maintenance_progress(self, payload):
@@ -1685,13 +1297,9 @@ class MainWindow(QMainWindow):
             except Exception:
                 percent_text = self._sync_percent_text(0)
         display_text = bar_text or percent_text or self._sync_percent_text(0)
-        if getattr(self._maintenance_worker, "mode", "") == "reindex":
+        if self._maintenance_controller.mode == "reindex":
             display_text = self._reindex_progress_text(payload, percent_text or display_text)
-        if message and self._maintenance_dialog is not None:
-            self._maintenance_dialog.set_message(message)
-        if self._maintenance_dialog is not None:
-            self._maintenance_dialog.set_progress(bar_value, display_text)
-        if getattr(self._maintenance_worker, "mode", "") == "reindex":
+        if self._maintenance_controller.mode == "reindex":
             phase = str(payload.get("phase", "") or "")
             status_text = (
                 tr("dialogs.main_window.synchronizing")
@@ -1703,20 +1311,10 @@ class MainWindow(QMainWindow):
             self._set_status_visual("syncing", "  " + message)
         self._set_sync_visual("syncing", value=bar_value, text=display_text)
 
-    def _cancel_node_maintenance(self):
-        if self._maintenance_dialog is not None:
-            self._maintenance_dialog.set_message(tr("dialogs.main_window.stopping_node"))
-        worker = self._maintenance_worker
-        if worker is not None and hasattr(worker, "stop"):
-            worker.stop()
-
     def _on_node_maintenance_done(self, mode: str):
-        if self._maintenance_dialog is not None:
-            self._maintenance_dialog.mark_finished()
-            self._maintenance_dialog.accept()
-            self._maintenance_dialog = None
-        self._maintenance_worker = None
         self._set_rescan_status_active(False)
+        if getattr(self, "_shutdown_w", None) is not None:
+            return
         self._restart_refresh_timers()
         self._update_wallet_key_actions()
         self._bring_to_front()
@@ -1725,12 +1323,9 @@ class MainWindow(QMainWindow):
 
     def _on_node_maintenance_error(self, message: str):
         cancelled = "cancelled" in str(message or "").lower()
-        if self._maintenance_dialog is not None:
-            self._maintenance_dialog.mark_finished()
-            self._maintenance_dialog.accept()
-            self._maintenance_dialog = None
-        self._maintenance_worker = None
         self._set_rescan_status_active(False)
+        if getattr(self, "_shutdown_w", None) is not None:
+            return
         self._restart_refresh_timers()
         self._update_wallet_key_actions()
         if not cancelled:
@@ -1742,9 +1337,6 @@ class MainWindow(QMainWindow):
     def _quit_and_stop(self):
         self._bring_to_front()
         shutdown_flow.start_shutdown(self)
-
-    def _on_shutdown_done(self):
-        shutdown_flow.finish_shutdown(self)
 
     def _new_t(self):
         self._create_address(shielded=False)
@@ -1763,239 +1355,123 @@ class MainWindow(QMainWindow):
     def _manual_refresh(self, *_):
         self.refresh(force_full=True)
 
-    def refresh_status(self):
-        if self._maintenance_worker is not None:
-            return
-        if self._status_refresh_running:
-            return
-        self._status_refresh_running = True
-        w = StatusWorker(self.rpc, txids=self._fast_status_txids())
-        self._threads.append(w)
-        w.finished.connect(lambda: self._threads.remove(w) if w in self._threads else None)
-        w.done.connect(self._on_status_done)
-        w.error.connect(self._on_status_err)
-        _track(w).start()
+    def _fast_txids_for_refresh(self) -> list[str]:
+        return fast_status_txids(
+            self._data,
+            self._cached_txs,
+            self.cache,
+            active_opid=self._active_opid,
+        )
 
-    def _on_status_done(self, data: dict):
-        self._status_refresh_running = False
-        self._status_rpc_failures = 0
-        chain = data.get("chain", {}) if isinstance(data, dict) else {}
-        blocks = chain.get("blocks", "-")
-        peers = data.get("peers", "-") if isinstance(data, dict) else "-"
+    def refresh_status(self):
+        self._refresh_controller.refresh_status()
+
+    def _render_node_state(self, state: NodeState):
+        if not isinstance(state, NodeState):
+            return
+        blocks = state.blocks
+        peers = state.peers
         try:
             self._cur_blocks = int(blocks)
         except Exception:
             pass
         self.lbl_blocks.setText(tr("dialogs.main_window.blocks", value=blocks))
         self.lbl_peers.setText(tr("dialogs.main_window.peers", value=peers))
-        self._apply_fast_block_state(chain, data.get("tx_updates", []) if isinstance(data, dict) else [])
+        self._apply_fast_block_state(state.chain or {}, [])
 
         if self._rescan_status_active:
             return
-
-        bootstrap_payload = data.get("bootstrap_progress") if isinstance(data, dict) else None
-        if isinstance(bootstrap_payload, dict):
+        if state.mode == "bootstrap":
             self._wallet_synced = False
-            try:
-                bar_value = int(bootstrap_payload.get("bar_value", 0) or 0)
-            except Exception:
-                bar_value = 0
+            payload = state.payload or {}
             self._set_status_visual("syncing", "  " + tr("dialogs.main_window.bootstrap_sync"))
             self._set_sync_visual(
                 "syncing",
-                value=bar_value,
+                value=state.progress_value,
                 text=self._bootstrap_progress_text(
-                    bootstrap_payload,
+                    payload,
                     tr("dialogs.main_window.bootstrap_sync"),
                 ),
             )
             self._update_wallet_key_actions()
             return
-
-        progress_payload = data.get("reindex_progress") if isinstance(data, dict) else None
-        if bool(chain.get("reindex")) or isinstance(progress_payload, dict):
+        if state.mode == "reindex":
             self._wallet_synced = False
-            if not isinstance(progress_payload, dict):
-                progress_payload = {"phase": "reindex_files", "bar_value": 0}
-            try:
-                bar_value = int(progress_payload.get("bar_value", 0) or 0)
-            except Exception:
-                bar_value = 0
+            payload = state.payload or {"phase": "reindex_files", "bar_value": 0}
             self._set_status_visual("syncing", "  " + tr("dialogs.main_window.reindex_confirm_title"))
             self._set_sync_visual(
                 "syncing",
-                value=bar_value,
+                value=state.progress_value,
                 text=self._reindex_progress_text(
-                    progress_payload,
+                    payload,
                     tr("dialogs.main_window.reindexing_block_files"),
                 ),
             )
             self._update_wallet_key_actions()
             return
-
-        vp = chain.get("verificationprogress")
-        if vp is None:
+        if state.mode == "rescan":
+            self._wallet_synced = False
+            block = int((state.payload or {}).get("block", 0) or 0)
+            self._set_status_visual("syncing", "  " + tr("dialogs.main_window.wallet_rescan_in_progress"))
+            self.lbl_blocks.setText(
+                tr("dialogs.main_window.blocks_rescanning", suffix=(" @ " + str(block)) if block else "")
+            )
+            self._set_sync_visual("syncing", value=0, text=self._sync_percent_text(0))
+            self._update_wallet_key_actions()
+            return
+        if state.mode == "busy":
             self._wallet_synced = False
             self._set_status_visual("syncing", "  " + tr("dialogs.main_window.node_busy_cached"))
             self._keep_current_sync_visual("syncing")
             self._update_wallet_key_actions()
             return
-        try:
-            pct = max(0.0, min(100.0, float(vp) * 100))
-        except Exception:
-            pct = 0.0
-        syncing = bool(chain.get("initialblockdownload") or chain.get("reindex")) or pct < 99.9
-        self._wallet_synced = not syncing
+        if state.mode == "offline":
+            self._wallet_synced = False
+            self._set_status_visual(
+                "offline",
+                "  " + (tr("dialogs.main_window.offline_cached") if self._data else tr("dialogs.main_window.not_connected")),
+            )
+            self._set_sync_visual("offline", value=0, text=self._sync_percent_text(0))
+            self._update_wallet_key_actions()
+            if state.show_connection_dialog:
+                result = _msg(
+                    self,
+                    tr("dialogs.main_window.connection_failed"),
+                    tr("dialogs.main_window.connection_failed_message") + "\n\n" + state.error,
+                    kind="warning",
+                    buttons=[
+                        (tr("common.buttons.ok"), int(QMessageBox.StandardButton.Ok)),
+                        (tr("dialogs.main_window.diagnostics"), 1001),
+                    ],
+                    default_button=1001,
+                )
+                if result == 1001:
+                    self._open_diag()
+            return
+
+        syncing = state.mode == "syncing"
+        self._wallet_synced = state.mode == "connected"
+        if self._wallet_synced:
+            self._last_sync_ts = int(time.time())
         self._set_status_visual(
             "syncing" if syncing else "connected",
             "  " + (tr("dialogs.main_window.synchronizing") if syncing else tr("dialogs.main_window.connected")),
         )
         self._set_sync_visual(
             "syncing" if syncing else "synced",
-            value=int(pct * 100),
-            text=self._sync_percent_text(pct),
+            value=state.progress_value,
+            text=self._sync_percent_text(state.percent or 0.0),
         )
         self._update_wallet_key_actions()
 
-    def _on_status_err(self, msg: str):
-        self._status_refresh_running = False
-        self._status_rpc_failures += 1
-        if self._status_rpc_failures < 3:
-            return
-        if is_port_open(self.rpc.host, self.rpc.port, timeout=0.5):
-            self._set_status_visual("syncing", "  " + tr("dialogs.main_window.node_busy_cached"))
-            self._keep_current_sync_visual("syncing")
-            return
-        if self._data:
-            last_sync = fmt_ts(self._last_sync_ts) if self._last_sync_ts else "-"
-            self._set_status_visual("offline", "  " + tr("dialogs.main_window.offline_cached"))
-            self._set_sync_visual("offline", value=0, text=self._sync_percent_text(0))
-        else:
-            self._set_status_visual("offline", "  " + tr("dialogs.main_window.not_connected"))
-            self._set_sync_visual("offline", value=0, text=self._sync_percent_text(0))
-
     def refresh(self, force_full: bool = False):
-        if self._maintenance_worker is not None:
-            return
-        if self._refresh_running: return
-        self._refresh_running = True
-        self._update_wallet_key_actions()
-        w = RefreshWorker(self.rpc, self.cache, force_full=force_full)
-        self._threads.append(w)
-        w.finished.connect(lambda: self._threads.remove(w) if w in self._threads else None)
-        w.step.connect(lambda s: None)
-        w.done.connect(self._on_done)
-        w.error.connect(self._on_err)
-        w.reindexing.connect(self._on_reindexing)
-        _track(w).start()
+        self._refresh_controller.refresh(force_full=force_full)
 
     def _on_done(self, data: dict):
-        self._refresh_running = False
-        self._status_rpc_failures = 0
         self._sync_wallet_cache_identity(data)
         self._apply_wallet_data(data, cached=False)
+        self._refresh_controller.note_wallet_snapshot(data)
         self._update_wallet_key_actions()
-
-    def _on_err(self, msg: str):
-        self._refresh_running = False
-        self._wallet_synced = False
-        self._update_wallet_key_actions()
-        rescan = read_recent_wallet_rescan_state()
-        if rescan is not None:
-            block = int(rescan.get("block", 0) or 0)
-            self._set_status_visual("syncing", "  " + tr("dialogs.main_window.wallet_rescan_in_progress"))
-            self.lbl_blocks.setText(tr("dialogs.main_window.blocks_rescanning", suffix=(" @ " + str(block)) if block else ""))
-            self._set_sync_visual(
-                "syncing",
-                value=0,
-                text=self._sync_percent_text(0)
-            )
-            return
-        if self._data and is_port_open(self.rpc.host, self.rpc.port, timeout=0.5):
-            last_sync = fmt_ts(self._last_sync_ts) if self._last_sync_ts else "-"
-            self._set_status_visual("syncing", "  " + tr("dialogs.main_window.node_busy_cached"))
-            self._keep_current_sync_visual("syncing")
-            return
-        if is_port_open(self.rpc.host, self.rpc.port, timeout=0.5):
-            self._set_status_visual("syncing", "  " + tr("dialogs.main_window.node_busy_cached"))
-            self._keep_current_sync_visual("syncing")
-            return
-        self._set_status_visual("offline", "  " + (tr("dialogs.main_window.offline_cached") if self._data else tr("dialogs.main_window.not_connected")))
-        last_sync = fmt_ts(self._last_sync_ts) if self._last_sync_ts else "-"
-        self._set_sync_visual("offline", value=0, text=self._sync_percent_text(0))
-        if not self._data:
-            if _msg(
-                self,
-                tr("dialogs.main_window.connection_failed"),
-                tr("dialogs.main_window.connection_failed_message") + "\n\n" + msg,
-                kind="warning",
-                buttons=[
-                    (tr("common.buttons.ok"), int(QMessageBox.StandardButton.Ok)),
-                    (tr("dialogs.main_window.diagnostics"), 1001),
-                ],
-                default_button=1001,
-            ) == 1001:
-                self._open_diag()
-
-    def _on_reindexing(self, data: dict):
-        self._refresh_running = False
-        self._wallet_synced = False
-        self._update_wallet_key_actions()
-        info  = data.get("info",  {})
-        chain = data.get("chain", {})
-        blocks  = info.get("blocks",  "-")
-        headers = info.get("headers", "-")
-        peers   = info.get("connections", "-")
-
-        self.lbl_blocks.setText(tr("dialogs.main_window.blocks", value=f"{blocks}"))
-        self.lbl_peers.setText(tr("dialogs.main_window.peers", value=peers))
-
-        bootstrap_payload = data.get("bootstrap_progress") if isinstance(data, dict) else None
-        if isinstance(bootstrap_payload, dict):
-            try:
-                bar_value = int(bootstrap_payload.get("bar_value", 0) or 0)
-            except Exception:
-                bar_value = 0
-            self._set_status_visual("syncing", "  " + tr("dialogs.main_window.bootstrap_sync"))
-            self._set_sync_visual(
-                "syncing",
-                value=bar_value,
-                text=self._bootstrap_progress_text(
-                    bootstrap_payload,
-                    tr("dialogs.main_window.bootstrap_sync"),
-                ),
-            )
-            return
-
-        progress_payload = data.get("reindex_progress") if isinstance(data, dict) else None
-        if isinstance(progress_payload, dict):
-            try:
-                bar_value = int(progress_payload.get("bar_value", 0) or 0)
-            except Exception:
-                bar_value = 0
-            self._set_status_visual("syncing", "  " + tr("dialogs.main_window.reindex_confirm_title"))
-            self._set_sync_visual(
-                "syncing",
-                value=bar_value,
-                text=self._reindex_progress_text(
-                    progress_payload,
-                    tr("dialogs.main_window.reindexing_block_files"),
-                ),
-            )
-            return
-
-        self._set_status_visual("syncing", "  " + tr("dialogs.main_window.synchronizing"))
-
-        vp = chain.get("verificationprogress")
-        if vp is not None:
-            pct = float(vp) * 100
-        elif str(headers).isdigit() and str(blocks).isdigit():
-            h = int(headers); b = int(blocks)
-            pct = (b / h * 100) if h > 0 else 0.0
-        else:
-            pct = 0.0
-
-        self._set_sync_visual("syncing", value=int(pct * 100), text=tr("dialogs.main_window.synchronization", percent=pct))
 
     def _tx_header_click(self, col: int):
         mapping = {0: "date", 2: "status", 3: "amount"}
@@ -2057,24 +1533,3 @@ class MainWindow(QMainWindow):
         self._clamp_fee_to_node_limit()
         send_flow.do_send(self)
 
-    def _cache_upsert_send_operation(self, opid: str, status: str):
-        send_flow.cache_upsert_send_operation(self, opid, status)
-
-    def _cache_update_send_operation(self, status: str, *, txid: str | None = None,
-                                     error: str | None = None, result=None):
-        send_flow.cache_update_send_operation(self, status, txid=txid, error=error, result=result)
-
-    def _send_ok(self, opid: str):
-        send_flow.send_ok(self, opid)
-
-    def _poll_status(self, status: str):
-        send_flow.poll_status(self, status)
-
-    def _poll_success(self, txid: str):
-        send_flow.poll_success(self, txid)
-
-    def _poll_failed(self, msg: str):
-        send_flow.poll_failed(self, msg)
-
-    def _send_err(self, msg: str):
-        send_flow.send_err(self, msg)

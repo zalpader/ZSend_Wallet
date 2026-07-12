@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
 import re
+from secrets import token_hex
 from datetime import datetime
 from pathlib import Path
 
@@ -19,6 +22,29 @@ _EXPORT_DUMP_PREFIX = "zsendexport"
 _LEGACY_EXPORT_DUMP_PREFIX = "ZSendWalletExport"
 _IMPORT_DUMP_PREFIX = "zsend_import_"
 _IMPORT_DUMP_SUFFIX = ".dump"
+
+
+def atomic_write_wallet_json(path: Path, payload: dict) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = destination.with_name(f".{destination.name}.{token_hex(8)}.tmp")
+    fd = None
+    try:
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            fd = None
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, destination)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 def _sanitize_dump_basename(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9]", "", value or "")

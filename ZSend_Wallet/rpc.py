@@ -85,18 +85,22 @@ class BitcoinZRPC:
         return self.call("z_validateaddress", [address])
 
     def ListAddresses(self) -> list:
+        first_error: RPCError | None = None
         try:
             result = self.call("listaddresses", [])
             if isinstance(result, list):
                 return result
-        except RPCError:
-            pass
+        except RPCError as exc:
+            first_error = exc
         try:
             rows = self.call("listreceivedbyaddress", [0, True])
-            return [r["address"] for r in rows]
-        except RPCError:
-            pass
-        return []
+            if isinstance(rows, list):
+                return [r["address"] for r in rows if isinstance(r, dict) and r.get("address")]
+        except RPCError as exc:
+            raise exc from first_error
+        if first_error is not None:
+            raise first_error
+        raise RPCError("Node returned an invalid transparent address list")
 
     def z_listAddresses(self) -> list:  return self.call("z_listaddresses", [])
     def z_getTotalBalance(self) -> dict: return self.call("z_gettotalbalance", [0])

@@ -739,12 +739,12 @@ class WalletCache:
                 SELECT
                     (SELECT COUNT(*) FROM addresses) AS addr_count,
                     (SELECT COUNT(*) FROM transactions) AS tx_count,
-                    (SELECT COUNT(*) FROM wallet_state) AS state_count
+                    (SELECT COUNT(*) FROM wallet_state WHERE key = 'last_refresh_at') AS refresh_count
                 """
             ).fetchone()
         if row is None:
             return False
-        return any(int(row[key] or 0) > 0 for key in ("addr_count", "tx_count", "state_count"))
+        return any(int(row[key] or 0) > 0 for key in ("addr_count", "tx_count", "refresh_count"))
 
     def refresh_unchanged(
         self,
@@ -1051,7 +1051,37 @@ class WalletCache:
                         last_checked_block=block_height,
                         commit=False,
                     )
+            if bool(data.get("address_snapshot_complete")):
+                current_addresses = {str(address) for address in t_addrs + z_addrs if str(address)}
+                if current_addresses:
+                    placeholders = ",".join("?" for _ in current_addresses)
+                    params = tuple(sorted(current_addresses))
+                    self._execute(
+                        f"DELETE FROM addresses WHERE address NOT IN ({placeholders})",
+                        params,
+                    )
+                    self._execute(
+                        f"""
+                        DELETE FROM operations
+                        WHERE from_address IS NOT NULL
+                          AND from_address NOT IN ({placeholders})
+                        """,
+                        params,
+                    )
+                else:
+                    self._execute("DELETE FROM addresses")
+                    self._execute("DELETE FROM operations")
             self.upsert_transactions(txs)
+            if bool(data.get("tx_snapshot_complete")):
+                current_txids = sorted({str(tx.get("txid", "") or "") for tx in txs if tx.get("txid")})
+                if current_txids:
+                    placeholders = ",".join("?" for _ in current_txids)
+                    self._execute(
+                        f"DELETE FROM transactions WHERE txid NOT IN ({placeholders})",
+                        tuple(current_txids),
+                    )
+                else:
+                    self._execute("DELETE FROM transactions")
             self._conn.commit()
 
     def clear_runtime_cache(self) -> None:

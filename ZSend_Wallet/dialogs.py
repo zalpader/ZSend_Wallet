@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QTextEdit,
     QVBoxLayout,
 )
@@ -340,7 +341,13 @@ class ConfigDialog(_DraggableDialog):
         if conf_path:
             h = QLabel(tr("dialogs.config.config_path", path=conf_path)); h.setStyleSheet("color:#8b949e;font-size:11px;")
             f.addRow(h)
-        self.e_host = QLineEdit(host); self.e_port = QLineEdit(str(port))
+        self.e_host = QLineEdit(host)
+        self.e_port = QSpinBox()
+        self.e_port.setRange(1, 65535)
+        try:
+            self.e_port.setValue(int(port))
+        except (TypeError, ValueError):
+            self.e_port.setValue(_RPC_DEFAULT_PORT)
         self.e_user = QLineEdit(user); self.e_pass = QLineEdit(pw)
         self.e_pass.setEchoMode(QLineEdit.EchoMode.Password)
         f.addRow(tr("dialogs.config.rpc_host"), self.e_host)
@@ -351,7 +358,7 @@ class ConfigDialog(_DraggableDialog):
         btns.accepted.connect(self.accept); btns.rejected.connect(self.reject); f.addRow(btns)
 
     def values(self):
-        return (self.e_host.text().strip(), int(self.e_port.text().strip() or "1979"),
+        return (self.e_host.text().strip(), self.e_port.value(),
                 self.e_user.text().strip(), self.e_pass.text().strip())
 
 

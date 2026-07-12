@@ -288,8 +288,16 @@ def cache_upsert_send_operation(window, opid: str, status: str) -> None:
         pass
 
 
-def cache_update_send_operation(window, status: str, *, txid: str | None = None, error: str | None = None, result=None) -> None:
-    opid = getattr(window, "_active_opid", "")
+def cache_update_send_operation(
+    window,
+    status: str,
+    *,
+    opid: str | None = None,
+    txid: str | None = None,
+    error: str | None = None,
+    result=None,
+) -> None:
+    opid = str(opid or getattr(window, "_active_opid", "") or "")
     if window.cache is None or not opid or opid == "submitting":
         return
     try:
@@ -302,54 +310,98 @@ def send_ok(window, opid: str) -> None:
     window._active_opid = opid
     cache_upsert_send_operation(window, opid, "submitted")
     QTimer.singleShot(5000, lambda: window.refresh(force_full=True))
+    _start_operation_poll(window, opid)
+
+
+def _start_operation_poll(window, opid: str) -> None:
+    opid = str(opid or "").strip()
+    if not opid:
+        return
+    polling = getattr(window, "_polling_opids", None)
+    if polling is None:
+        polling = set()
+        window._polling_opids = polling
+    if opid in polling:
+        return
+    polling.add(opid)
     pw = PollWorker(window.rpc, opid)
     window._threads.append(pw)
     pw.finished.connect(lambda: window._threads.remove(pw) if pw in window._threads else None)
-    pw.status_update.connect(lambda status: poll_status(window, status))
-    pw.success.connect(lambda txid: poll_success(window, txid))
-    pw.failed.connect(lambda msg: poll_failed(window, msg))
-    pw.cancelled.connect(lambda msg: poll_cancelled(window, msg))
-    pw.unknown.connect(lambda msg: poll_unknown(window, msg))
+    pw.status_update.connect(lambda status, current=opid: poll_status(window, status, current))
+    pw.success.connect(lambda txid, current=opid: poll_success(window, txid, current))
+    pw.failed.connect(lambda msg, current=opid: poll_failed(window, msg, current))
+    pw.cancelled.connect(lambda msg, current=opid: poll_cancelled(window, msg, current))
+    pw.unknown.connect(lambda msg, current=opid: poll_unknown(window, msg, current))
     _track(pw).start()
 
 
-def poll_status(window, status: str) -> None:
+def resume_pending_operations(window) -> None:
+    if window.cache is None:
+        return
+    try:
+        operations = window.cache.list_operations(limit=50)
+    except Exception:
+        return
+    active = [
+        str(row.get("opid", "") or "").strip()
+        for row in operations
+        if str(row.get("status", "") or "").lower() in {"submitted", "queued", "executing"}
+    ]
+    active = [opid for opid in active if opid][:8]
+    if not active:
+        return
+    window._active_opid = active[0]
+    for opid in active:
+        _start_operation_poll(window, opid)
+    window._update_send_btn()
+
+
+def _finish_operation_poll(window, opid: str) -> None:
+    getattr(window, "_polling_opids", set()).discard(opid)
+    if getattr(window, "_active_opid", "") == opid:
+        window._active_opid = ""
+        window._pending_send = None
+
+
+def poll_status(window, status: str, opid: str | None = None) -> None:
     node_status = str(status or "").strip().lower()
     if node_status not in {"queued", "executing"}:
         node_status = "executing"
-    cache_update_send_operation(window, node_status)
+    cache_update_send_operation(window, node_status, opid=opid)
 
 
-def poll_success(window, txid: str) -> None:
-    cache_update_send_operation(window, "success", txid=txid, result={"txid": txid})
-    window._active_opid = ""
-    window._pending_send = None
-    window.e_memo.clear()
+def poll_success(window, txid: str, opid: str | None = None) -> None:
+    current = str(opid or getattr(window, "_active_opid", "") or "")
+    clear_current_form = bool(getattr(window, "_active_opid", "") == current and window._pending_send)
+    cache_update_send_operation(window, "success", opid=current, txid=txid, result={"txid": txid})
+    _finish_operation_poll(window, current)
+    if clear_current_form:
+        window.e_memo.clear()
     window._update_send_btn()
     window.refresh(force_full=True)
 
 
-def poll_failed(window, msg: str) -> None:
-    cache_update_send_operation(window, "failed", error=msg)
-    window._active_opid = ""
-    window._pending_send = None
+def poll_failed(window, msg: str, opid: str | None = None) -> None:
+    current = str(opid or getattr(window, "_active_opid", "") or "")
+    cache_update_send_operation(window, "failed", opid=current, error=msg)
+    _finish_operation_poll(window, current)
     window._update_send_btn()
     window.refresh(force_full=True)
     _msg_critical(window, tr("dialogs.send_flow.send_error"), msg)
 
 
-def poll_cancelled(window, msg: str) -> None:
-    cache_update_send_operation(window, "cancelled", error=msg)
-    window._active_opid = ""
-    window._pending_send = None
+def poll_cancelled(window, msg: str, opid: str | None = None) -> None:
+    current = str(opid or getattr(window, "_active_opid", "") or "")
+    cache_update_send_operation(window, "cancelled", opid=current, error=msg)
+    _finish_operation_poll(window, current)
     window._update_send_btn()
     window.refresh(force_full=True)
 
 
-def poll_unknown(window, msg: str) -> None:
-    cache_update_send_operation(window, "unknown", error=msg)
-    window._active_opid = ""
-    window._pending_send = None
+def poll_unknown(window, msg: str, opid: str | None = None) -> None:
+    current = str(opid or getattr(window, "_active_opid", "") or "")
+    cache_update_send_operation(window, "unknown", opid=current, error=msg)
+    _finish_operation_poll(window, current)
     window._update_send_btn()
     window.refresh(force_full=True)
     _msg_warning(

@@ -1,15 +1,47 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton, QVBoxLayout
+import time
 
-from .common import _track
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton, QVBoxLayout
+
+from .common import _RUNNING_WORKERS, _track
 from .dialogs import _DraggableDialog
 from .locales import tr
 from .workers import ShutdownWorker
 
 
+def stop_gui_workers(*, exclude=(), timeout_seconds: float = 0.8) -> None:
+    excluded = {worker for worker in exclude if worker is not None}
+    workers = [worker for worker in list(_RUNNING_WORKERS) if worker not in excluded]
+    for worker in workers:
+        if hasattr(worker, "stop"):
+            try:
+                worker.stop()
+            except Exception:
+                pass
+        else:
+            try:
+                worker.requestInterruption()
+            except Exception:
+                pass
+
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    for worker in workers:
+        try:
+            if not worker.isRunning():
+                continue
+            remaining_ms = int(max(0.0, deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                break
+            worker.wait(remaining_ms)
+        except Exception:
+            pass
+
+
 def start_shutdown(window) -> None:
+    if getattr(window, "_shutdown_w", None) is not None:
+        return
     dlg = _DraggableDialog(window)
     dlg.setMinimumWidth(300)
     v = QVBoxLayout(dlg)
@@ -39,7 +71,12 @@ def start_shutdown(window) -> None:
     if not dlg.exec() or not dlg._ok:
         return
 
-    window._timer.stop()
+    refresh_controller = getattr(window, "_refresh_controller", None)
+    if refresh_controller is not None:
+        refresh_controller.pause_all()
+    maintenance = getattr(window, "_maintenance_controller", None)
+    if maintenance is not None:
+        maintenance.cancel_for_shutdown()
     window._shutdown_overlay = QFrame(window.centralWidget())
     window._shutdown_overlay.setObjectName("card")
     window._shutdown_overlay.setStyleSheet(
@@ -82,12 +119,30 @@ def start_shutdown(window) -> None:
     window._shutdown_w = ShutdownWorker(window.rpc)
     window._shutdown_w.status.connect(window._shutdown_lbl.setText)
     window._shutdown_w.done.connect(lambda: finish_shutdown(window))
+    window._shutdown_w.error.connect(lambda message: fail_shutdown(window, message))
     _track(window._shutdown_w).start()
 
 
 def finish_shutdown(window) -> None:
-    if hasattr(window, "_shutdown_overlay"):
+    if getattr(window, "_shutdown_overlay", None) is not None:
         window._shutdown_overlay.hide()
         window._shutdown_overlay.deleteLater()
+        window._shutdown_overlay = None
+    window._shutdown_w = None
     window.setEnabled(True)
-    QApplication.quit()
+    window._exit_gui()
+
+
+def fail_shutdown(window, message: str) -> None:
+    if getattr(window, "_shutdown_overlay", None) is not None:
+        window._shutdown_overlay.hide()
+        window._shutdown_overlay.deleteLater()
+        window._shutdown_overlay = None
+    window._shutdown_w = None
+    window.setEnabled(True)
+    refresh_controller = getattr(window, "_refresh_controller", None)
+    if refresh_controller is not None:
+        refresh_controller.resume(trigger_refresh=True)
+    from .dialogs import _msg_critical
+
+    _msg_critical(window, tr("dialogs.shutdown_flow.error_title"), str(message))

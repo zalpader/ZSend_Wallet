@@ -23,6 +23,7 @@ from .common import (
     node_running,
 )
 from .debug_runtime import debug_exception, debug_log
+from .locales import tr
 from .rpc import BitcoinZRPC, RPCError
 from .wallet_cache import WalletCache, btcz_to_zat
 
@@ -59,7 +60,11 @@ def reindex_progress_value(current_index: int, max_index: int) -> int:
 
 
 def reindex_block_file_label(current_index: int, max_index: int) -> str:
-    return f"Reindexing block file {max(0, int(current_index))} / {max(0, int(max_index))}"
+    return tr(
+        "dialogs.main_window.reindexing_block_file",
+        current=max(0, int(current_index)),
+        total=max(0, int(max_index)),
+    )
 
 
 def _chain_sync_percent(chain: dict) -> float:
@@ -258,7 +263,7 @@ class ParamsWorker(QThread):
         try:
             debug_log("ParamsWorker started", params_dir=str(PARAMS_DIR), file_count=len(PARAMS_FILES))
             PARAMS_DIR.mkdir(parents=True, exist_ok=True)
-            self.status.emit("Checking ZcashParams")
+            self.status.emit(tr("dialogs.workers.checking_params"))
 
             corrupt = []
             for idx, pf in enumerate(PARAMS_FILES, start=1):
@@ -271,8 +276,6 @@ class ParamsWorker(QThread):
                     exists=path.exists(),
                 )
                 if path.exists():
-                    self.status.emit(f"Verifying {pf['name']}")
-                    size_mismatch = False
                     try:
                         actual_size = int(path.stat().st_size)
                         expected_size = int(pf["size"])
@@ -282,17 +285,33 @@ class ParamsWorker(QThread):
                             actual_size=actual_size,
                             expected_size=expected_size,
                         )
-                        size_mismatch = actual_size != expected_size
-                        if size_mismatch:
-                            debug_log(
-                                "Params size mismatch detected; deferring removal until hash check",
-                                name=pf["name"],
-                                actual_size=actual_size,
-                                expected_size=expected_size,
-                            )
                     except OSError as exc:
-                        debug_exception(f"Failed to stat/unlink params file {pf['name']}", exc)
+                        debug_exception(f"Failed to stat params file {pf['name']}", exc)
                         corrupt.append(pf["name"])
+                        continue
+
+                    if actual_size < expected_size:
+                        debug_log(
+                            "Partial params file retained for resume",
+                            name=pf["name"],
+                            actual_size=actual_size,
+                            expected_size=expected_size,
+                        )
+                        continue
+                    if actual_size > expected_size:
+                        corrupt.append(pf["name"])
+                        debug_log(
+                            "Oversized params file removed",
+                            name=pf["name"],
+                            actual_size=actual_size,
+                            expected_size=expected_size,
+                        )
+                        try:
+                            path.unlink()
+                        except OSError as exc:
+                            debug_exception(f"Failed to remove oversized params file {pf['name']}", exc)
+                            self.failed.emit(tr("dialogs.workers.remove_corrupt_failed", file=pf["name"], error=exc))
+                            return
                         continue
 
                     if not path.exists():
@@ -300,6 +319,7 @@ class ParamsWorker(QThread):
                         corrupt.append(pf["name"])
                         continue
 
+                    self.status.emit(tr("dialogs.workers.verifying_file", file=pf["name"]))
                     debug_log("Hashing params file", name=pf["name"])
                     try:
                         actual_sha = _sha256_file(path)
@@ -309,11 +329,6 @@ class ParamsWorker(QThread):
                         continue
                     debug_log("Params file hash complete", name=pf["name"], sha256=actual_sha)
                     if actual_sha == pf["sha256"]:
-                        if size_mismatch:
-                            debug_log(
-                                "Params file accepted despite size metadata mismatch because hash matched",
-                                name=pf["name"],
-                            )
                         continue
 
                     if actual_sha != pf["sha256"]:
@@ -323,12 +338,22 @@ class ParamsWorker(QThread):
                             path.unlink()
                         except OSError as exc:
                             debug_exception(f"Failed to remove corrupt params file {pf['name']}", exc)
+                            self.failed.emit(tr("dialogs.workers.remove_corrupt_failed", file=pf["name"], error=exc))
+                            return
 
             if corrupt:
                 debug_log("Corrupt params removed", files=corrupt)
-                self.status.emit(f"Corrupt files removed, re-downloading: {', '.join(corrupt)}")
+                self.status.emit(tr("dialogs.workers.corrupt_params", files=", ".join(corrupt)))
 
-            to_download = [pf for pf in PARAMS_FILES if not (PARAMS_DIR / pf["name"]).exists()]
+            to_download = []
+            for pf in PARAMS_FILES:
+                path = PARAMS_DIR / pf["name"]
+                try:
+                    complete = path.exists() and path.stat().st_size == int(pf["size"])
+                except OSError:
+                    complete = False
+                if not complete:
+                    to_download.append(pf)
             debug_log(
                 "Params download plan prepared",
                 download_count=len(to_download),
@@ -337,7 +362,7 @@ class ParamsWorker(QThread):
 
             if not to_download:
                 debug_log("Params verification completed without downloads")
-                self.status.emit("ZcashParams OK.")
+                self.status.emit(tr("dialogs.workers.params_ok"))
                 self.done.emit()
                 return
 
@@ -370,7 +395,7 @@ class ParamsWorker(QThread):
                         existing_bytes=existing,
                         url=pf["url"],
                     )
-                    self.status.emit(f"Downloading {pf['name']}")
+                    self.status.emit(tr("dialogs.workers.downloading_file", file=pf["name"]))
                     try:
                         headers = {"Range": f"bytes={existing}-"} if existing else {}
                         with requests.get(pf["url"], headers=headers, stream=True, timeout=30) as r:
@@ -408,17 +433,17 @@ class ParamsWorker(QThread):
                     except Exception as e:
                         debug_exception(f"Params download attempt failed for {pf['name']}", e)
                         if attempt >= 2:
-                            self.failed.emit(f"Failed to download {pf['name']}:\n{e}")
+                            self.failed.emit(tr("dialogs.workers.download_failed", file=pf["name"], error=e))
                             return
 
                     if not path.exists():
                         debug_log("Downloaded params file missing before verification", name=pf["name"])
                         if attempt >= 2:
-                            self.failed.emit(f"Downloaded file disappeared before verification: {pf['name']}")
+                            self.failed.emit(tr("dialogs.workers.download_disappeared", file=pf["name"]))
                             return
                         continue
 
-                    self.status.emit(f"Verifying {pf['name']}")
+                    self.status.emit(tr("dialogs.workers.verifying_file", file=pf["name"]))
                     debug_log("Verifying downloaded params hash", name=pf["name"])
                     try:
                         actual_sha = _sha256_file(path)
@@ -429,22 +454,19 @@ class ParamsWorker(QThread):
                     if actual_sha == pf["sha256"]:
                         break
                     if attempt >= 2:
-                        self.failed.emit(
-                            f"File {pf['name']} is corrupted after download.\n"
-                            "Please check your internet connection and try again."
-                        )
+                        self.failed.emit(tr("dialogs.workers.download_corrupt", file=pf["name"]))
                         return
                     if path.exists():
                         path.unlink()
                         debug_log("Removed downloaded params after hash mismatch", name=pf["name"])
-                    self.status.emit(f"Hash mismatch for {pf['name']}, retrying")
+                    self.status.emit(tr("dialogs.workers.hash_retry", file=pf["name"]))
 
             debug_log("ParamsWorker completed successfully")
-            self.status.emit("ZcashParams OK.")
+            self.status.emit(tr("dialogs.workers.params_ok"))
             self.done.emit()
         except Exception as e:
             debug_exception("ParamsWorker failed unexpectedly", e)
-            self.failed.emit(f"ZcashParams check failed unexpectedly:\n{e}")
+            self.failed.emit(tr("dialogs.workers.params_unexpected", error=e))
 
 
 _NODE_READY_POLL_SECS = 3
@@ -453,6 +475,22 @@ _NODE_READY_MAX_COLD_WAIT_SECS = 360
 
 def _is_node_busy_message(code: int, message: str) -> bool:
     return code == -28 or any(k in message for k in _NODE_MSGS)
+
+
+def _localized_node_busy_message(message: str) -> str:
+    if "Loading block index" in message:
+        return tr("dialogs.workers.loading_block_index")
+    if "Activating best chain" in message:
+        return tr("dialogs.workers.activating_best_chain")
+    if "Rewinding blocks if needed" in message:
+        return tr("dialogs.workers.rewinding_blocks")
+    if "Loading wallet" in message:
+        return tr("dialogs.workers.loading_wallet")
+    if "Rescanning" in message:
+        return tr("dialogs.workers.rescanning_blockchain")
+    if "Verifying blocks" in message:
+        return tr("dialogs.workers.verifying_blocks")
+    return str(message or "").splitlines()[0][:80]
 
 
 class NodeStartWorker(QThread):
@@ -466,32 +504,23 @@ class NodeStartWorker(QThread):
     def run(self):
         try:
             debug_log("NodeStartWorker started")
-            self.status.emit("Checking node status")
+            self.status.emit(tr("dialogs.workers.checking_node"))
 
             should_launch = True
             try:
                 self.rpc.getBlockchainInfo()
                 debug_log("Configured RPC responded before launch")
-                self.status.emit("Node is ready!")
+                self.status.emit(tr("dialogs.ui.startup_ready"))
                 self.ready.emit()
                 return
             except RPCError as e:
                 msg = str(e)
                 debug_log("Initial configured RPC probe failed", code=e.code, rpc_message=msg)
                 if e.code == 401:
-                    self.failed.emit(
-                        "HTTP 401: rpcuser/rpcpassword mismatch with bitcoinz.conf.\n"
-                        "Delete bitcoinz.conf and restart the wallet to regenerate it."
-                    )
+                    self.failed.emit(tr("dialogs.workers.rpc_401"))
                     return
                 if e.code == 403:
-                    self.failed.emit(
-                        "HTTP 403: node is rejecting connections.\n"
-                        "Add these lines to bitcoinz.conf:\n"
-                        "  server=1\n"
-                        "  rpcallowip=127.0.0.1\n"
-                        "then restart the node."
-                    )
+                    self.failed.emit(tr("dialogs.workers.rpc_403"))
                     return
                 if _is_node_busy_message(e.code, msg):
                     should_launch = False
@@ -506,12 +535,12 @@ class NodeStartWorker(QThread):
                 should_launch=should_launch,
             )
             if binary and should_launch:
-                self.status.emit(f"Starting {binary.name}")
+                self.status.emit(tr("dialogs.workers.starting_binary", name=binary.name))
                 proc = launch_node(binary)
                 debug_log("Node launch attempted", binary=str(binary), launched=proc is not None)
                 time.sleep(5)
             elif not binary:
-                self.status.emit("bitcoinzd.exe not found - waiting for manual start")
+                self.status.emit(tr("dialogs.workers.node_binary_missing_wait"))
 
             attempt = 0
             cold_wait_started = time.monotonic()
@@ -522,7 +551,7 @@ class NodeStartWorker(QThread):
                     debug_log("RPC readiness probe", attempt=attempt)
                     self.rpc.getBlockchainInfo()
                     debug_log("Node RPC responded successfully", attempt=attempt)
-                    self.status.emit("Node is ready!")
+                    self.status.emit(tr("dialogs.ui.startup_ready"))
                     self.ready.emit()
                     return
                 except RPCError as e:
@@ -540,31 +569,19 @@ class NodeStartWorker(QThread):
                     )
 
                     if code == 401:
-                        self.failed.emit(
-                            "HTTP 401: rpcuser/rpcpassword mismatch with bitcoinz.conf.\n"
-                            "Delete bitcoinz.conf and restart the wallet to regenerate it."
-                        )
+                        self.failed.emit(tr("dialogs.workers.rpc_401"))
                         return
                     if code == 403:
-                        self.failed.emit(
-                            "HTTP 403: node is rejecting connections.\n"
-                            "Add these lines to bitcoinz.conf:\n"
-                            "  server=1\n"
-                            "  rpcallowip=127.0.0.1\n"
-                            "then restart the node."
-                        )
+                        self.failed.emit(tr("dialogs.workers.rpc_403"))
                         return
 
                     if node_busy:
-                        display = next(
-                            (v for k, v in _NODE_MSGS.items() if k in msg),
-                            msg.splitlines()[0]
-                        )
+                        display = _localized_node_busy_message(msg)
                         self.status.emit(display)
                     elif "Connection refused" in msg or "refused" in msg.lower():
-                        self.status.emit(f"Waiting for node ({attempt * _NODE_READY_POLL_SECS}s)")
+                        self.status.emit(tr("dialogs.workers.waiting_node_seconds", seconds=attempt * _NODE_READY_POLL_SECS))
                     else:
-                        self.status.emit(f"Waiting ({msg.splitlines()[0][:60]})")
+                        self.status.emit(tr("dialogs.workers.waiting_message", message=msg.splitlines()[0][:60]))
 
                 if not seen_node_busy:
                     cold_wait_elapsed = time.monotonic() - cold_wait_started
@@ -573,17 +590,13 @@ class NodeStartWorker(QThread):
                             "NodeStartWorker timed out waiting for cold node",
                             elapsed_seconds=round(cold_wait_elapsed, 1),
                         )
-                        self.failed.emit(
-                            "Node did not respond within 360 seconds.\n"
-                            "Check that bitcoinzd.exe is present and bitcoinz.conf is correct.\n"
-                            "Open Diagnostics for details."
-                        )
+                        self.failed.emit(tr("dialogs.workers.node_start_timeout"))
                         return
 
                 time.sleep(_NODE_READY_POLL_SECS)
         except Exception as e:
             debug_exception("NodeStartWorker failed unexpectedly", e)
-            self.failed.emit(f"Node start failed unexpectedly:\n{e}")
+            self.failed.emit(tr("dialogs.workers.node_start_unexpected", error=e))
 
 
 class MaintenanceRestartWorker(QThread):
@@ -675,10 +688,7 @@ class MaintenanceRestartWorker(QThread):
 
     def stop(self):
         self._stop_requested = True
-        try:
-            _clone_rpc(self.rpc).stopNode()
-        except Exception:
-            pass
+        self.requestInterruption()
 
     def detach(self):
         self._detach_requested = True
@@ -706,7 +716,7 @@ class MaintenanceRestartWorker(QThread):
         msg = str(e)
         if self._is_connection_refused(msg):
             return "Waiting for BitcoinZ node to start"
-        return next((v for k, v in _NODE_MSGS.items() if k in msg), msg.splitlines()[0][:80])
+        return _localized_node_busy_message(msg)
 
     def _wait_for_rpc_down(self):
         deadline = time.monotonic() + self._STOP_WAIT_SECS
@@ -727,8 +737,9 @@ class MaintenanceRestartWorker(QThread):
                 rpc_down = True
             if rpc_down and not node_running():
                 return
-            self.status.emit("Waiting for node to stop")
+            self.status.emit(tr("dialogs.workers.waiting_node_stop"))
             time.sleep(1)
+        raise RuntimeError(tr("dialogs.workers.maintenance_stop_timeout"))
 
     def _wait_until_ready(self, proc=None):
         attempt = 0
@@ -747,8 +758,8 @@ class MaintenanceRestartWorker(QThread):
                 chain = self.rpc.getBlockchainInfo() or {}
                 if bool(chain.get("reindex")):
                     if not hint_emitted:
-                        self._emit_progress("reindex_files", "Reindexing blockchain", bar_text="Reindexing block files", bar_value=0)
-                        self.status.emit("Reindexing blockchain")
+                        self._emit_progress("reindex_files", tr("dialogs.workers.reindexing"), bar_text=tr("dialogs.main_window.reindexing_block_files"), bar_value=0)
+                        self.status.emit(tr("dialogs.workers.reindexing"))
                     self._sleep_poll(self._POLL_SECS)
                     continue
                 if self.mode == "reindex" and isinstance(reindex_hint, dict) and str(reindex_hint.get("phase", "")) == "reindex_files":
@@ -760,11 +771,11 @@ class MaintenanceRestartWorker(QThread):
                 ):
                     self._emit_progress(
                         "syncing",
-                        "Synchronizing blockchain",
+                        tr("dialogs.workers.synchronizing_blockchain"),
                         bar_value=int(pct * 100),
                         percent=pct,
                     )
-                    self.status.emit("Synchronizing blockchain")
+                    self.status.emit(tr("dialogs.workers.synchronizing_blockchain"))
                     self._sleep_poll(self._POLL_SECS)
                     continue
                 # Probe a wallet RPC that does not touch the keypool. During
@@ -781,30 +792,30 @@ class MaintenanceRestartWorker(QThread):
                         if chain.get("verificationprogress") is not None and pct < 99.9:
                             self._emit_progress(
                                 "syncing",
-                                "Synchronizing blockchain",
+                                tr("dialogs.workers.synchronizing_blockchain"),
                                 bar_value=int(pct * 100),
                                 percent=pct,
                             )
-                            self.status.emit("Synchronizing blockchain")
+                            self.status.emit(tr("dialogs.workers.synchronizing_blockchain"))
                             self._sleep_poll(self._POLL_SECS)
                             continue
                     if not self._emit_reindex_progress_hint():
                         self._emit_progress(
                             "finalizing",
-                            "Finalizing reindex",
-                            bar_text="Finalizing reindex",
+                            tr("dialogs.main_window.finalizing_reindex"),
+                            bar_text=tr("dialogs.main_window.finalizing_reindex"),
                             bar_value=_REINDEX_FINALIZING_VALUE,
                         )
                     self._sleep_poll(self._POLL_SECS)
                     continue
                 self.status.emit(self._status_from_rpc_error(e))
             except Exception:
-                self.status.emit(f"Waiting for node ({attempt * self._POLL_SECS}s)")
+                self.status.emit(tr("dialogs.workers.waiting_node_seconds", seconds=attempt * self._POLL_SECS))
             self._sleep_poll(self._POLL_SECS)
 
     def _recover_normal_node(self, binary, failed_label: str, failure: Exception):
-        self.status.emit("Maintenance start failed; restoring normal node")
-        self._emit_progress("recovering", "Maintenance start failed; restoring normal node")
+        self.status.emit(tr("dialogs.workers.maintenance_recovering"))
+        self._emit_progress("recovering", tr("dialogs.workers.maintenance_recovering"))
         proc = launch_node(binary)
         if proc is None:
             raise RuntimeError(f"{failure}\n\nRecovery failed: bitcoinzd.exe could not be started normally.")
@@ -814,8 +825,8 @@ class MaintenanceRestartWorker(QThread):
     def run(self):
         try:
             label = f"-{self.mode}"
-            self.status.emit("Stopping BitcoinZ node")
-            self._emit_progress("stopping", "Stopping BitcoinZ node")
+            self.status.emit(tr("dialogs.main_window.stopping_node"))
+            self._emit_progress("stopping", tr("dialogs.main_window.stopping_node"))
             try:
                 self.rpc.stopNode()
             except Exception as exc:
@@ -824,21 +835,21 @@ class MaintenanceRestartWorker(QThread):
 
             binary = find_node()
             if binary is None:
-                self.error.emit("bitcoinzd.exe not found")
+                self.error.emit(tr("dialogs.workers.node_binary_missing"))
                 return
 
             if self.mode == "reindex":
                 self._max_blk_index = max_reindex_blk_index()
                 self._debug_log_start_offset = _file_size(DATA_DIR / "debug.log")
-            self.status.emit(f"Starting BitcoinZ node with {label}")
-            self._emit_progress("starting", f"Starting BitcoinZ node with {label}")
+            self.status.emit(tr("dialogs.workers.starting_node_mode", mode=label))
+            self._emit_progress("starting", tr("dialogs.workers.starting_node_mode", mode=label))
             proc = launch_node(binary, extra_args=[label])
             if proc is None:
                 self._recover_normal_node(binary, label, RuntimeError(f"Failed to start bitcoinzd.exe with {label}"))
 
-            self.status.emit(f"Waiting for {label} to finish")
+            self.status.emit(tr("dialogs.workers.waiting_mode", mode=label))
             if self.mode == "reindex":
-                self._emit_progress("reindex_files", "Reindexing blockchain", bar_text="Reindexing block files", bar_value=0)
+                self._emit_progress("reindex_files", tr("dialogs.workers.reindexing"), bar_text=tr("dialogs.main_window.reindexing_block_files"), bar_value=0)
             try:
                 self._wait_until_ready(proc)
             except RuntimeError as e:
@@ -876,6 +887,7 @@ class RefreshWorker(QThread):
         self.cache = cache
         self.force_full = force_full
         self._stop_requested = False
+        self._shielded_receive_complete = True
 
     def stop(self):
         self._stop_requested = True
@@ -1162,6 +1174,7 @@ class RefreshWorker(QThread):
         return enriched
 
     def _merge_shielded_received_transactions(self, txs: list, z_addrs: list[str]) -> list:
+        self._shielded_receive_complete = True
         if not z_addrs:
             return txs
         rows = list(txs or [])
@@ -1173,6 +1186,7 @@ class RefreshWorker(QThread):
             try:
                 notes = self.rpc.z_listReceivedByAddress(zaddr, 0) or []
             except Exception:
+                self._shielded_receive_complete = False
                 continue
             for note in notes:
                 if not isinstance(note, dict):
@@ -1432,6 +1446,7 @@ class RefreshWorker(QThread):
                 txs = self._enrich_transactions(txs)
                 txs = self._merge_operation_transactions(txs)
                 txs = self._merge_shielded_received_transactions(txs, z_addrs)
+                tx_snapshot_complete = bool(tx_snapshot_complete and self._shielded_receive_complete)
             except RPCError as e:
                 if _is_reindex_err(e):
                     self._reindex_emit(info, chain, t_addrs, z_addrs, total_bal=total_bal)
@@ -1452,30 +1467,28 @@ class RefreshWorker(QThread):
             def _fetch_bal(addr):
                 try:
                     return addr, _balance_rpc().z_getBalance(addr)
-                except RPCError as e:
-                    return addr, e
-                except Exception:
-                    return addr, 0.0
+                except Exception as exc:
+                    return addr, exc
 
             all_addrs = list(t_addrs) + list(z_addrs)
             t_bal: dict = {}
             z_bal: dict = {}
-            bal_error: str = ""
+            balance_errors: list[tuple[str, Exception]] = []
             if all_addrs:
                 with ThreadPoolExecutor(max_workers=min(6, len(all_addrs))) as ex:
                     futures = {ex.submit(_fetch_bal, a): a for a in all_addrs}
                     for fut in as_completed(futures):
                         addr, bal = fut.result()
-                        if isinstance(bal, RPCError):
-                            if not bal_error and bal.code in (401, 403):
-                                bal_error = str(bal)
-                            bal = 0.0
+                        if isinstance(bal, Exception):
+                            balance_errors.append((addr, bal))
+                            continue
                         if addr in t_addrs:
                             t_bal[addr] = bal
                         else:
                             z_bal[addr] = bal
-            if bal_error:
-                self.error.emit(f"Balance fetch error: {bal_error}")
+            if balance_errors:
+                address, exc = balance_errors[0]
+                self.error.emit(tr("dialogs.workers.balance_fetch_failed", address=address, error=exc))
                 return
 
             data = {
@@ -1484,6 +1497,7 @@ class RefreshWorker(QThread):
                 "t_addrs": t_addrs, "z_addrs": z_addrs,
                 "t_balances": t_bal, "z_balances": z_bal,
                 "total_bal": total_bal, "txs": txs,
+                "address_snapshot_complete": True,
                 "tx_snapshot_complete": tx_snapshot_complete,
                 "reindexing": False,
             }
@@ -1552,7 +1566,8 @@ class StatusWorker(QThread):
             return "pending"
         return "confirmed"
 
-    def _probe_transaction(self, rpc: BitcoinZRPC, txid: str) -> dict | None:
+    @classmethod
+    def _probe_transaction(cls, rpc: BitcoinZRPC, txid: str) -> dict | None:
         source: dict = {}
         full: dict = {}
         raw: dict = {}
@@ -1579,7 +1594,7 @@ class StatusWorker(QThread):
         update = {
             "txid": txid,
             "confirmations": confirmations,
-            "status": self._status_from_confirmations(confirmations),
+            "status": cls._status_from_confirmations(confirmations),
         }
         field_map = {
             "blockhash": "blockhash",
@@ -1646,6 +1661,49 @@ class StatusWorker(QThread):
             self.error.emit(str(e))
         except Exception as e:
             self.error.emit(str(e))
+
+
+class TxStatusBatchWorker(QThread):
+    _TX_PROBE_LIMIT = 8
+    done = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, rpc: BitcoinZRPC, txids: list[str] | tuple[str, ...]):
+        super().__init__()
+        self.endpoint = rpc.endpoint()
+        self._stop_requested = False
+        self.txids: list[str] = []
+        seen: set[str] = set()
+        for value in txids:
+            txid = str(value or "").strip()
+            if not txid or txid in seen:
+                continue
+            seen.add(txid)
+            self.txids.append(txid)
+            if len(self.txids) >= self._TX_PROBE_LIMIT:
+                break
+
+    def stop(self):
+        self._stop_requested = True
+        self.requestInterruption()
+
+    def _should_stop(self) -> bool:
+        return bool(self._stop_requested or self.isInterruptionRequested())
+
+    def run(self):
+        try:
+            rpc = BitcoinZRPC(*self.endpoint)
+            updates: list[dict] = []
+            for txid in self.txids:
+                if self._should_stop():
+                    return
+                update = StatusWorker._probe_transaction(rpc, txid)
+                if update:
+                    updates.append(update)
+            if not self._should_stop():
+                self.done.emit(updates)
+        except Exception as exc:
+            self.error.emit(str(exc))
 
 
 class PollWorker(QThread):
@@ -1748,7 +1806,7 @@ class PollWorker(QThread):
                         if txid:
                             self.success.emit(txid)
                         else:
-                            self.unknown.emit("Send operation completed, but the node did not return a transaction id.")
+                            self.unknown.emit(tr("dialogs.workers.send_missing_txid"))
                         return
                     if s == "failed":
                         err = item.get("error", {})
@@ -1756,34 +1814,34 @@ class PollWorker(QThread):
                         self.failed.emit(msg)
                         return
                     if s == "cancelled":
-                        self.cancelled.emit("Send operation was cancelled by the node.")
+                        self.cancelled.emit(tr("dialogs.workers.send_cancelled"))
                         return
                     if s in {"queued", "executing"}:
                         self.status_update.emit(s)
                     else:
-                        self.unknown.emit(f"Unexpected send operation status: {s or 'empty'}")
+                        self.unknown.emit(tr("dialogs.workers.send_unexpected_status", status=s or "empty"))
                         return
                 else:
                     empty_status_count += 1
                     self.status_update.emit("queued")
                     if empty_status_count >= self.empty_status_limit:
-                        self.unknown.emit("Send operation id is no longer visible in the node.")
+                        self.unknown.emit(tr("dialogs.workers.send_opid_missing"))
                         return
             except RPCError as e:
                 rpc_error_count += 1
                 self.status_update.emit("executing")
                 if rpc_error_count >= self.rpc_error_limit:
-                    self.unknown.emit(f"Could not poll send operation status: {e}")
+                    self.unknown.emit(tr("dialogs.workers.send_poll_error", error=e))
                     return
             except Exception as e:
                 rpc_error_count += 1
                 debug_exception("PollWorker.run", e)
                 self.status_update.emit("executing")
                 if rpc_error_count >= self.rpc_error_limit:
-                    self.unknown.emit("Could not poll send operation status.")
+                    self.unknown.emit(tr("dialogs.workers.send_poll_failed"))
                     return
             if self.timeout_seconds >= 0 and (time.monotonic() - started_at) >= self.timeout_seconds:
-                self.unknown.emit("Send operation polling timed out.")
+                self.unknown.emit(tr("dialogs.workers.send_poll_timeout"))
                 return
             self._sleep_interruptible(self._poll_interval(elapsed))
 
@@ -1859,17 +1917,37 @@ class SendWorker(QThread):
 class ShutdownWorker(QThread):
     status = Signal(str)
     done   = Signal()
+    error  = Signal(str)
+
+    _STOP_TIMEOUT_SECS = 60
 
     def __init__(self, rpc: BitcoinZRPC):
         super().__init__(); self.rpc = _clone_rpc(rpc)
 
     def run(self):
-        self.status.emit("Sending stop command to node")
+        self.status.emit(tr("dialogs.shutdown_flow.sending_stop"))
         try:
             self.rpc.stopNode()
-        except RPCError:
-            pass
-        except Exception:
-            pass
-        self.status.emit("Node stop command sent")
-        self.done.emit()
+        except RPCError as exc:
+            message = str(exc)
+            if not MaintenanceRestartWorker._is_connection_refused(message) and "stopping" not in message.lower():
+                self.error.emit(str(exc))
+                return
+        except Exception as exc:
+            self.error.emit(str(exc))
+            return
+
+        self.status.emit(tr("dialogs.shutdown_flow.waiting_stop"))
+        deadline = time.monotonic() + self._STOP_TIMEOUT_SECS
+        while time.monotonic() < deadline:
+            try:
+                self.rpc.getBlockchainInfo()
+            except RPCError as exc:
+                if MaintenanceRestartWorker._is_connection_refused(str(exc)) or "stopping" in str(exc).lower():
+                    self.done.emit()
+                    return
+            except Exception:
+                self.done.emit()
+                return
+            time.sleep(0.5)
+        self.error.emit(tr("dialogs.shutdown_flow.stop_timeout"))
