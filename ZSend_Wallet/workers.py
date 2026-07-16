@@ -5,6 +5,7 @@ import re
 import time
 import traceback
 import threading
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from .common import (
     find_node,
     launch_node,
     node_running,
+    tx_fingerprint,
 )
 from .debug_runtime import debug_exception, debug_log
 from .locales import tr
@@ -1641,6 +1643,24 @@ class StatusWorker(QThread):
                 DATA_DIR / "debug.log",
                 reset_on_node_start=True,
             )
+            wallet_activity = None
+            try:
+                chain_progress = float(chain.get("verificationprogress", 0) or 0)
+            except Exception:
+                chain_progress = 0.0
+            wallet_ready = bool(
+                not chain.get("reindex")
+                and not chain.get("initialblockdownload")
+                and chain_progress >= 0.999
+            )
+            if wallet_ready:
+                try:
+                    recent_txs = rpc.listTransactions(20, 0) or []
+                    wallet_activity = hashlib.sha256(
+                        tx_fingerprint(recent_txs).encode("utf-8")
+                    ).hexdigest()
+                except Exception:
+                    pass
             tx_updates = []
             for txid in self.txids:
                 if self._should_stop():
@@ -1654,6 +1674,7 @@ class StatusWorker(QThread):
                 "chain": chain,
                 "peers": peers,
                 "tx_updates": tx_updates,
+                "wallet_activity": wallet_activity,
                 "reindex_progress": reindex_progress,
                 "bootstrap_progress": bootstrap_progress,
             })

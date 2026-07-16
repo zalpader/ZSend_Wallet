@@ -54,6 +54,11 @@ class RefreshController(QObject):
         self._tx_worker: TxStatusBatchWorker | None = None
         self._status_rpc_failures = 0
         self._has_wallet_data = False
+        self._last_status_block: int | None = None
+        self._last_wallet_activity: str | None = None
+        self._wallet_ready = False
+        self._status_baselined = False
+        self._refresh_after_current = False
 
         self.wallet_timer = QTimer(self)
         self.wallet_timer.setInterval(self.WALLET_INTERVAL_MS)
@@ -107,6 +112,11 @@ class RefreshController(QObject):
         self._paused = True
         self._generation += 1
         self._status_rpc_failures = 0
+        self._last_status_block = None
+        self._last_wallet_activity = None
+        self._wallet_ready = False
+        self._status_baselined = False
+        self._refresh_after_current = False
         self.wallet_timer.stop()
         self.status_timer.stop()
         self.reconcile_timer.stop()
@@ -214,6 +224,9 @@ class RefreshController(QObject):
             self._refresh_worker = None
             if generation == self._generation:
                 self.refreshing_changed.emit(False)
+                if self._refresh_after_current and not self._paused:
+                    self._refresh_after_current = False
+                    QTimer.singleShot(0, self.refresh)
 
     def _refresh_fast_transactions(self, generation: int) -> None:
         if self._tx_worker is not None:
@@ -239,7 +252,56 @@ class RefreshController(QObject):
         if not self._valid(generation, worker, self._status_worker):
             return
         self._status_rpc_failures = 0
+        self._refresh_for_wallet_activity(data)
         self.node_state.emit(self._state_from_status(data))
+
+    def _refresh_for_wallet_activity(self, data: dict) -> None:
+        data = data if isinstance(data, dict) else {}
+        chain = data.get("chain") if isinstance(data.get("chain"), dict) else {}
+        try:
+            block = int(chain.get("blocks"))
+        except Exception:
+            block = None
+        activity = data.get("wallet_activity")
+        activity = str(activity) if activity is not None else None
+        percent = self._progress_percent(chain)
+        ready = bool(
+            block is not None
+            and not chain.get("reindex")
+            and not chain.get("initialblockdownload")
+            and percent is not None
+            and percent >= 99.9
+        )
+
+        became_ready = self._status_baselined and ready and not self._wallet_ready
+        block_changed = (
+            ready
+            and self._last_status_block is not None
+            and block != self._last_status_block
+        )
+        activity_changed = (
+            ready
+            and activity is not None
+            and self._last_wallet_activity is not None
+            and activity != self._last_wallet_activity
+        )
+        self._wallet_ready = ready
+        self._status_baselined = True
+        if block is not None:
+            self._last_status_block = block
+        if activity is not None:
+            self._last_wallet_activity = activity
+
+        if became_ready or block_changed or activity_changed:
+            self._request_wallet_refresh()
+
+    def _request_wallet_refresh(self) -> None:
+        if self._paused:
+            return
+        if self._refresh_worker is not None:
+            self._refresh_after_current = True
+            return
+        self.refresh()
 
     def _on_status_error(self, generation: int, worker, message: str) -> None:
         if not self._valid(generation, worker, self._status_worker):
